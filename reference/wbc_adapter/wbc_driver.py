@@ -135,6 +135,36 @@ def make_action_subscriber(host: str, port: int, conflate: bool) -> zmq.Socket:
     return sock
 
 
+def _q29(q):
+    """Reduce a robot state vector to ik.py's 29-joint `_BODY_Q_NAMES` layout.
+
+    `body_q` is NOT one shape. `--state-source boundary` (:5557) delivers the
+    29-wide Unitree body convention -- legs 0-11, waist 12-14, left arm 15-21,
+    right arm 22-28 -- which is exactly what ik.py expects. `--state-source
+    wbc` (the DEFAULT, and what every live run has actually used) delivers the
+    WBC's own model q, built from g1_29dof_with_hand.urdf: 43 wide, with the
+    Dex3 hand joints interleaved -- legs 0-11, waist 12-14, left arm 15-21,
+    LEFT HAND 22-28, right arm 29-35, right hand 36-42.
+
+    Slicing that 43-wide vector with [:29] silently hands ik.py the left hand
+    where the right arm should be, so the right arm's IK seed, its
+    velocity-clamp anchor and its on-reject "hold measured pose" fallback all
+    read constant hand values instead of the arm. The left arm is 15-21 in
+    both layouts, so only the right arm is affected -- that is the left/right
+    asymmetry seen live from 2026-09-04 onward.
+
+    Confirmed against the loaded robot model (nq=43, right_arm=[29..35]),
+    against this adapter's own startup banner (upper_body width=28, right_arm
+    slots=[14..20] == full-q 29..35 minus 15), and on 1963 captured
+    env_state_act records where q[22:29] is identically zero in every one
+    while the true right arm q[29:36] moved 0.4558 rad. Fixed 2026-09-21.
+
+    Shape-based so the boundary (29) and zeros (29) paths are untouched.
+    """
+    q = np.asarray(q, dtype=np.float64).reshape(-1)
+    return np.concatenate([q[0:22], q[29:36]]) if q.shape[0] == 43 else q[:29]
+
+
 def run_decoupled(args, sub: zmq.Socket, stats: Stats):
     from ik import IKSettings, UpperBodyIK
 
@@ -358,7 +388,7 @@ def run_decoupled(args, sub: zmq.Socket, stats: Stats):
         res0 = None
         raw_results = []
         for i, row in enumerate(rows[:args.max_waypoints]):
-            res = solver.solve_row(row, body_q[:29])
+            res = solver.solve_row(row, _q29(body_q))
             if i == 0:
                 res0 = res
             stats.waypoints += 1
@@ -418,14 +448,14 @@ def run_decoupled(args, sub: zmq.Socket, stats: Stats):
 
         for i, res in enumerate(raw_results):
             # res.upper_body[:14] is always [left arm(7), right arm(7)], in
-            # the same order as body_q[15:29] -- see ik.py's _BODY_Q_NAMES.
+            # the same order as _q29(body_q)[15:29] -- see ik.py's _BODY_Q_NAMES.
             # Waist/hand slots are already held at measured values (ik.py's
             # own waist passthrough; mapper.build_waypoint's for hands), so
             # only the arm portion can ever jump and needs clamping here.
             arms = res.upper_body[:14].copy()
             if max_step is not None:
                 if i == 0:
-                    last_commanded_arms = np.asarray(fresh_body_q[15:29], dtype=np.float64)
+                    last_commanded_arms = np.asarray(_q29(fresh_body_q)[15:29], dtype=np.float64)
                 arms = last_commanded_arms + np.clip(
                     arms - last_commanded_arms, -max_step, max_step)
                 last_commanded_arms = arms
