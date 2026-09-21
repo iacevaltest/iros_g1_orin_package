@@ -28,8 +28,14 @@ Two things about that diagram trip people up:
    link is *yours* — `components/transport.py` is team-owned and you may
    replace it entirely. The organizer never speaks it.
 
-You build the two containers. You do not build or modify anything in
+You build the two policy components. You do not build or modify anything in
 `boundary/` or `reference/`.
+
+Note the architecture is **hybrid, not containers all the way down**. Your
+policy server is containerised on Thor; the robot-side stack it drives
+(`wbc_adapter`, the camera/state bridge, and the sonic-lane control binary)
+runs natively on the robot's onboard computer. `reference/` is that native
+half — published so you can see what consumes your output.
 
 ## What is in here
 
@@ -59,24 +65,48 @@ GPU: sm_110 (Blackwell)         CUDA 13.2, driver 595.78
 no kernels for it. See `docs/TROUBLESHOOTING.md` before assuming a CUDA
 library works.
 
-## Launching your Thor container
+## Running your policy
 
-```bash
-docker run -d --name ikea-iros-thor \
-  --runtime nvidia --network host \
-  -e NVIDIA_DISABLE_REQUIRE=1 \
-  -v /path/to/weights:/model:ro \
-  <your-registry>/<your-image>@sha256:<digest>
-```
+**This repository does not prescribe how you package or launch your policy.**
+What it specifies is the contract your code must meet at the sockets in the
+diagram above. How you get there is yours.
 
-Non-negotiable parts:
+In practice teams do this two ways, and both are fine:
 
-- `--runtime nvidia`, **not** `--gpus all` — Jetson does not support the latter.
-- `-e NVIDIA_DISABLE_REQUIRE=1` — without it NGC CUDA bases fail their
-  driver-compat gate and you silently get **no GPU at all**.
-- `--network host` — the boundary is raw TCP, not a Docker bridge network.
-- Weights mounted **read-only**, never baked into the image.
-- Pin by `@sha256:` digest, never `:latest`.
+- **A container image** — the common path. Digest-pinned, declared in your
+  `manifest.yaml`, launched with `docker run`.
+- **A conda environment plus your own scripts** — no container at all.
+
+If you containerise, a few Thor-specific details save time:
+
+- **`--runtime nvidia`.** Docker's default runtime on this box is plain
+  `runc`, so the GPU must be requested explicitly. `--gpus all` alone is not
+  reliable on Jetson; passing both is harmless.
+- **`-e NVIDIA_DISABLE_REQUIRE=1`.** NGC CUDA base images bake in a
+  driver-compatibility gate that fails here. Without it you get a container
+  that starts cleanly and has **no GPU at all**.
+- **`--network host`.** The boundary is raw TCP, not a Docker bridge network.
+- **Mount weights read-only**; don't bake them into the image.
+
+If you run natively, the same constraints apply minus the Docker flags: the
+boundary ports must be reachable, and your environment needs whatever your
+model requires. `linux/arm64` either way.
+
+## The robot side runs natively, on ROS 2
+
+Nothing in `reference/` is containerised. On the robot's onboard computer:
+
+- `real_orin*.py` publishes cameras and state over ZMQ
+- `wbc_adapter/wbc_driver.py` consumes your actions from `:5556` (pure ZMQ)
+- `wbc_goal.py` publishes goals onto the **ROS 2** topic
+  `ControlPolicy/upper_body_pose` and reads state from `G1Env/env_state_act`
+- the sonic-lane control binary is native C++/TensorRT
+
+You do not run any of this — it is published so the layer consuming your
+output is not a black box. One consequence worth knowing: because ROS 2 is in
+the path, `RMW_IMPLEMENTATION` must match across every process on that side.
+A mismatch is silent — everything starts, topics never connect. See
+`config/ros_dds_env.sh`.
 
 ## Robot-specific values
 
