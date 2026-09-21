@@ -11,7 +11,7 @@ you strictly have to read.
 ## The split — who runs what
 
 ```
-   YOUR THOR CONTAINER              THE ROBOT'S ONBOARD COMPUTER
+   YOUR POLICY, ON THOR             THE ROBOT'S ONBOARD COMPUTER
    (GPU, your inference)            (organizer's code, you run it)
 
    policy server  ──BINDS :8765──<  your client  ──BINDS :5556──<  wbc_adapter
@@ -31,11 +31,12 @@ Two things about that diagram trip people up:
 You build the two policy components. You do not build or modify anything in
 `boundary/` or `reference/`.
 
-Note the architecture is **hybrid, not containers all the way down**. Your
-policy server is containerised on Thor; the robot-side stack it drives
+Note the two halves are packaged differently. Your policy runs on Thor,
+however you choose to package it. The robot-side stack it drives
 (`wbc_adapter`, the camera/state bridge, and the sonic-lane control binary)
-runs natively on the robot's onboard computer. `reference/` is that native
-half — published so you can see what consumes your output.
+runs natively on the robot's onboard computer — not in a container.
+`reference/` is that native half, published so the layer consuming your
+output is not a black box.
 
 ## What is in here
 
@@ -53,7 +54,7 @@ half — published so you can see what consumes your output.
 
 ## Target platform
 
-The Thor box your container runs on:
+The Thor box your policy runs on:
 
 ```
 NVIDIA Jetson AGX Thor          Ubuntu 24.04 (noble), L4T R39 rev 2.1
@@ -61,7 +62,7 @@ GPU: sm_110 (Blackwell)         CUDA 13.2, driver 595.78
 122 GiB unified RAM, 14 cores   Docker 29.7.2, default runtime: runc
 ```
 
-`linux/arm64` images only. **sm_110 is new** — prebuilt CUDA wheels often have
+Everything must be `linux/arm64`. **sm_110 is new** — prebuilt CUDA wheels often have
 no kernels for it. See `docs/TROUBLESHOOTING.md` before assuming a CUDA
 library works.
 
