@@ -405,7 +405,7 @@ def run_decoupled(args, sub: zmq.Socket, stats: Stats):
         # the actual gap rather than the solve-time symptom of it. Lane/
         # policy-agnostic -- this touches only the clamp, not IK itself, so
         # it applies identically to GR00T-based teams using the sonic or
-        # decoupled lane through this same adapter, not just ARS.
+        # decoupled lane through this same adapter, not just one team.
         fresh_body_q = body_q
         if state_sub is not None:
             fresh_q = state_sub.get_body_q()
