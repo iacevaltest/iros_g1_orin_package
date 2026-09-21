@@ -1,0 +1,787 @@
+#!/usr/bin/env python3
+"""The organizer-side WBC adapter: subscribe a team's :5556, drive the robot.
+
+This is the piece the boundary contract always assumed existed and that no
+bench run has ever actually had -- "the organizer's WBC dials in". With it,
+a team's own Thor + Orin containers run COMPLETELY UNMODIFIED, exactly per
+their own INSTRUCTIONS.md, and nothing team-specific lives here.
+
+    team Thor container  --:8765-->  team Orin container
+                                          | binds :5556  (boundary/actions.py)
+                                          v
+                                   THIS ADAPTER (subscriber)
+                                          |
+             decoupled: IK -> joint-space goal -> ROS2 ControlPolicy/upper_body_pose
+             sonic:     relay protocol-v4 pose frames -> gear_sonic_deploy
+                                          |
+                                          v
+                                    real G1 motors
+
+Lane handling, both verified against NVlabs/GR00T-WholeBodyControl v1.1:
+
+  decoupled  The WBC consumes JOINT SPACE (`target_upper_body_pose`); it
+             runs no IK in its 50 Hz loop. So we IK here (see ik.py -- read
+             its frame-convention warning). `target_time` accepts a list,
+             so a whole (T,25) chunk goes over as an interpolated waypoint
+             trajectory rather than just its first row.
+
+  sonic      The organizer's `boundary/actions.py` pose frame is already
+             byte-identical to the protocol-v4 "pose" message
+             `gear_sonic_deploy` consumes -- same `pose` topic, same 1280B
+             header, same token_state(1,64)/frame_index(1,)/
+             left+right_hand_joints(1,7) fields. So this lane is a RELAY,
+             not a translation. We decode only to validate and report.
+
+DRY-RUN BY DEFAULT. `--live` is required to actually publish anything
+robot-ward.
+
+SAFETY -- this adapter is not a safety system. It re-validates the contract
+floor (`boundary_wire.validate_*`) and holds the last known-good arm target
+when IK says a pose is unreachable, but well-formed is not the same as
+sane. The independent e-stop is what stops the robot, and for the sonic
+lane specifically the stop that actually works is `gear_sonic_deploy`'s own
+(gamepad Select/O, or its command-topic stop flag) -- whoever owns
+rt/lowcmd wins, and that is the deploy binary, not this process.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import struct
+import sys
+import time
+from pathlib import Path
+
+import numpy as np
+import zmq
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from boundary_wire import (  # noqa: E402
+    POSE_TOPIC, TASKSPACE_TOPIC, BoundaryStateSubscriber, decode_pose,
+    decode_taskspace, validate_pose, validate_taskspace,
+)
+import wbc_goal  # noqa: E402
+
+LANES = ("decoupled", "sonic")
+
+
+class Stats:
+    def __init__(self):
+        self.messages = 0
+        self.rejected = 0
+        self.stale = 0
+        self.waypoints = 0
+        self.left_ok = 0
+        self.right_ok = 0
+        self.published = 0
+        self.gripper_sent = 0
+        self.solve_ms = 0.0
+        self.t0 = time.monotonic()
+
+    def report(self) -> str:
+        el = max(time.monotonic() - self.t0, 1e-6)
+        line = (f"[stats] {self.messages} msgs ({self.messages / el:.1f}/s), "
+                f"{self.rejected} rejected, {self.stale} stale, "
+                f"{self.published} published, {self.gripper_sent} gripper")
+        if self.waypoints:
+            # Per-waypoint, which is what IK is actually solved per. Anything
+            # over 100% here means the denominator is wrong, not that the
+            # policy is unusually good.
+            line += (f" | IK accept over {self.waypoints} waypoints: "
+                     f"L={100.0 * self.left_ok / self.waypoints:.1f}% "
+                     f"R={100.0 * self.right_ok / self.waypoints:.1f}%"
+                     f", {self.solve_ms / self.waypoints:.1f} ms/waypoint")
+        return line
+
+
+def make_action_subscriber(host: str, port: int, conflate: bool) -> zmq.Socket:
+    """Dial into the team's bound :5556. We are the subscriber -- the team's
+    client is the long-lived-side PUB, per boundary/actions.py.
+
+    `conflate` is lane-dependent and matters:
+      decoupled -- CONFLATE on. Each (T,25) chunk is a complete fresh plan
+        from a fresh observation, so a newer chunk supersedes an older one
+        outright. Without this, any moment where our IK is slower than the
+        team's publish rate silently builds an unbounded backlog and every
+        chunk we pull is progressively staler -- the robot ends up tracking
+        the past. Same reasoning as boundary/cameras.py's own CONFLATE.
+      sonic -- CONFLATE off. That lane is a sequential 50 Hz stream of
+        individual latent rows; dropping rows is dropping motion.
+    """
+    ctx = zmq.Context.instance()
+    sock = ctx.socket(zmq.SUB)
+    sock.setsockopt(zmq.SUBSCRIBE, b"")     # both topics; we dispatch on prefix
+    sock.setsockopt(zmq.CONFLATE, 1 if conflate else 0)
+    sock.setsockopt(zmq.LINGER, 0)
+    # 2026-08-25: was 1000ms. The WBC has its OWN internal watchdog --
+    # "Teleop mode timeout after 1.0s, injecting safe goal" -- that fires
+    # if IT goes >1.0s without receiving a fresh goal FROM US, and that
+    # injected transition does not go through our own IK/clamp pipeline at
+    # all (it's the WBC's own code, not ours), so nothing in wbc_driver.py
+    # or ik.py can bound it. Measured live: this fired immediately before
+    # the worst violation of the session (right_elbow -13.234 rad/s) on a
+    # run where --max-joint-vel had just been LOWERED (2.0, from 4.0) --
+    # our own clamp getting more conservative had no effect, because the
+    # violation wasn't coming through our clamp's path at all. A 1000ms
+    # RCVTIMEO meant this loop itself could silently wait the entire 1.0s
+    # doing nothing between chunks -- racing the WBC's own timeout and
+    # sometimes losing. Shortened so the loop wakes up often enough to
+    # publish a keepalive (see the zmq.Again handler below) well before
+    # the WBC's deadline, regardless of how sparse the team's actual data
+    # is.
+    sock.setsockopt(zmq.RCVTIMEO, 200)
+    sock.connect(f"tcp://{host}:{port}")
+    return sock
+
+
+def run_decoupled(args, sub: zmq.Socket, stats: Stats):
+    from ik import IKSettings, UpperBodyIK
+
+    backend = None
+    if args.live:
+        backend = wbc_goal.make_backend(args.wbc_backend)
+        print(f"[adapter] WBC backend: {backend.health()}")
+        if args.engage_policy:
+            # Wait for the WBC's own state topic to actually be live before
+            # sending the toggle -- sending it before rclpy has received a
+            # single state message risks it landing before the subscriber
+            # side of the control loop is fully up. Bounded wait; if state
+            # never arrives this is the same "no robot state" situation the
+            # rest of the loop already refuses to act on, so fail loud here
+            # too rather than silently skipping the toggle.
+            print("[adapter] --engage-policy: waiting for WBC state before "
+                  "sending toggle_policy_action...")
+            deadline = time.monotonic() + 5.0
+            while time.monotonic() < deadline and backend.health()["state_stale"]:
+                time.sleep(0.05)
+            if backend.health()["state_stale"]:
+                print("[adapter] --engage-policy: WBC state never came up in 5s "
+                      "-- NOT sending the toggle. use_policy_action stays False "
+                      "(safe default: hold current position).", file=sys.stderr)
+            else:
+                backend.toggle_policy_action()
+                print("[adapter] --engage-policy: sent toggle_policy_action=True "
+                      "once. Confirm engagement independently -- decode "
+                      "/ControlPolicy/lower_body_policy_status, don't just trust "
+                      "this log line.")
+    else:
+        print("[adapter] DRY-RUN -- decoding, validating and solving IK, "
+              "publishing nothing to the WBC.")
+
+    # Where real body_q comes from. The WBC's own state topic is
+    # authoritative when it is running; :5557 lets a DRY RUN measure against
+    # the real arm configuration with no WBC and no ROS 2 at all, which is
+    # the cheapest way to get a meaningful reachability number.
+    state_sub = None
+    if args.state_source == "boundary":
+        state_sub = BoundaryStateSubscriber(args.orin_host, args.state_port)
+        print(f"[adapter] body_q from the organizer's state endpoint "
+              f"{state_sub.endpoint}")
+    elif args.state_source == "wbc":
+        print("[adapter] body_q from the WBC's own state topic")
+    else:
+        print("[adapter] WARNING: --state-source zeros -- IK is solved against a "
+              "ZERO joint vector, not the real arm. Shapes and plumbing only; "
+              "any reachability number from this run is meaningless.",
+              file=sys.stderr)
+
+    solver = UpperBodyIK(IKSettings(max_err=args.max_ik_err),
+                         include_waist=args.enable_waist,
+                         warm_start=args.ik_warm_start)
+
+    # Never guess the upper-body width. Query the WBC's own robot model and
+    # overwrite only the arm slots -- see upper_body_map.py. A mismatch here
+    # CRASHES the control loop, which on the real robot is the balance
+    # controller.
+    mapper = None
+    # Only reach for decoupled_wbc's robot model when we are actually about
+    # to publish to a real ros2 control loop -- NOT just because that is the
+    # default --wbc-backend value. A pure dry-run (no --live) needs none of
+    # this, and must keep working in g1_control_venv, which has no
+    # decoupled_wbc installed (that only exists in the separate g1_wbc conda
+    # env). Getting this wrong broke Phase A: `python3 wbc_driver.py --lane
+    # decoupled --state-source boundary --verbose` (no --live) started
+    # importing decoupled_wbc anyway and crashed with ModuleNotFoundError.
+    if (args.live and args.wbc_backend == "ros2") or args.upper_body_from_model:
+        from upper_body_map import UpperBodyMapper
+        waist_loc = "lower_and_upper_body" if args.enable_waist else "lower_body"
+        mapper = UpperBodyMapper(waist_location=waist_loc)
+        print(f"[adapter] {mapper.describe()}")
+    else:
+        print(f"[adapter] bench mode: emitting {solver.width}-wide vectors "
+              f"(no robot model available to map against)")
+
+    # Gripper. The WBC cannot drive Dex1-1 (it is Dex3-only), so the hand
+    # columns of (T,25) would otherwise be silently discarded and no grasp
+    # could occur. run_wbc_with_dex1.py injects these into the same
+    # rt/lowcmd message the body already goes out on -- a second publisher
+    # is not possible, see that file's header.
+    dex1_pub = None
+    if args.dex1_port:
+        import msgpack as _mp
+        _ctx = zmq.Context.instance()
+        dex1_pub = _ctx.socket(zmq.PUB)
+        dex1_pub.setsockopt(zmq.LINGER, 0)
+        dex1_pub.connect(f"tcp://{args.dex1_host}:{args.dex1_port}")
+        print(f"[adapter] gripper -> tcp://{args.dex1_host}:{args.dex1_port} "
+              f"(requires the WBC be launched via run_wbc_with_dex1.py)")
+    else:
+        print("[adapter] --dex1-port 0: gripper commands DISCARDED, no grasp possible")
+
+    # Rate-limits the commanded arm joints against the last waypoint this
+    # adapter actually scheduled. IK has no notion of how far away in TIME
+    # its target is -- chunk_hz alone schedules the first waypoint of every
+    # chunk only 1/chunk_hz out, so a solved pose far from the current one
+    # implies whatever velocity that delta needs, with nothing capping it.
+    # Measured tripping the WBC's own real-hardware-only joint safety
+    # monitor (joint_safety.py, +-6 rad/s): first at ~7.3-7.4 rad/s on the
+    # first live goal (fixed by clamping), then again later at -6.570 rad/s
+    # on right_elbow_joint on a run where the clamp was active the whole
+    # time -- see the i==0 branch below for why (the clamp's reference point
+    # can silently drift from the robot's real position if it's only ever
+    # updated from what THIS process last commanded). Reset every chunk to
+    # ground-truth body_q now, not just once at startup.
+    last_commanded_arms = None
+    # Last successfully-published waypoint + its accompanying fields, kept
+    # around purely so a keepalive (see zmq.Again below) can hold this
+    # exact position rather than reconstructing one from parts.
+    last_goal_template: dict | None = None
+    keepalives_sent = 0
+    # 2026-09-03: wall-clock time of the last thing actually published to
+    # the WBC, by ANY path (real chunk or keepalive). See the mid-solve
+    # watchdog check below for why this exists separately from the
+    # zmq.Again-triggered keepalive above -- that one only fires when this
+    # loop is BLOCKED waiting for a message; it does nothing if the loop is
+    # instead BUSY solving one. Traced a real live violation
+    # (right_elbow_joint -8.992 rad/s) to exactly that gap: the team's
+    # client published on a steady ~300ms cadence the whole time (confirmed
+    # independently via capture_evidence.py's own separate subscription,
+    # zero gaps >330ms anywhere near the violation) and the adapter's own
+    # [stats] line showed 0 keepalives for the entire run right up to the
+    # trip -- so `zmq.Again` never fired even though the WBC's own >1.0s
+    # "no fresh goal" watchdog still did, and injected the unclamped
+    # transition that caused it (confirmed: a "Teleop mode timeout" line
+    # sits directly before that violation in the WBC log). CONFLATE=1 on
+    # this socket means as long as a message is EVER waiting, `sub.recv()`
+    # returns immediately rather than timing out -- so a slow processing
+    # cycle (not a slow client) can silently eat the whole 1.0s budget with
+    # this loop technically busy the entire time, never once blocked long
+    # enough to hit the existing keepalive path.
+    last_publish_time = time.monotonic()
+    # Margin under the WBC's ~1.0s watchdog -- fire before it does, not
+    # after. Checked between individual waypoint solves (see below), not
+    # just between chunks, since the solve loop itself is where a slow
+    # cycle actually accumulates.
+    KEEPALIVE_DEADLINE_S = 0.7
+
+    last_report = time.monotonic()
+    while True:
+        try:
+            msg = sub.recv()
+        except zmq.Again:
+            # 2026-08-25: publish a keepalive -- hold the last commanded
+            # position, refreshed target_time -- rather than doing nothing.
+            # See the RCVTIMEO comment above: the WBC has its own ~1.0s
+            # "no fresh goal" watchdog that injects an UNCLAMPED transition
+            # of its own if we go quiet too long. A short RCVTIMEO alone
+            # only helps if we actually USE the extra wakeups to publish
+            # something -- this is that.
+            if args.live and backend is not None and last_goal_template is not None:
+                keep_goal = wbc_goal.build_goal(
+                    upper_body_waypoints=last_goal_template["upper_body"],
+                    target_time=[time.monotonic() + 1.0 / args.chunk_hz],
+                    base_height_command=last_goal_template["base_height"],
+                    navigate_cmd=last_goal_template["navigate_cmd"],
+                    wrist_pose=last_goal_template["wrist_pose"],
+                )
+                backend.publish_goal(keep_goal)
+                keepalives_sent += 1
+                last_publish_time = time.monotonic()
+            else:
+                print("[adapter] no actions on :5556 yet (is the team's Orin client up?)")
+            continue
+        if not msg.startswith(TASKSPACE_TOPIC):
+            continue
+
+        try:
+            chunk = decode_taskspace(msg)
+        except Exception as exc:
+            stats.rejected += 1
+            print(f"[adapter] undecodable frame: {exc}", file=sys.stderr)
+            continue
+
+        stats.messages += 1
+        problems = validate_taskspace(chunk)
+        if problems:
+            stats.rejected += 1
+            print(f"[adapter] REJECTED chunk: {'; '.join(problems)}", file=sys.stderr)
+            continue
+
+        body_q = None
+        if state_sub is not None:
+            body_q = state_sub.get_body_q()
+        elif backend is not None:
+            body_q = backend.get_robot_q()
+        if body_q is None:
+            if args.live or args.state_source != "zeros":
+                # No state means no valid IK seed and no waist hold. Refusing
+                # is the safe branch: publishing a goal solved against a
+                # guessed configuration is worse than publishing nothing, and
+                # measuring against one is worse than not measuring.
+                print("[adapter] no robot state yet -- skipping chunk", file=sys.stderr)
+                continue
+            body_q = np.zeros(29)
+
+        # DO NOT re-apply the sender's latency compensation. The reference
+        # client already drops the rows its own inference latency consumed
+        # AND backdates issued_at to when that inference started
+        # (components/client.py: send_chunk(chunk[skip:], issued_at=now-L)).
+        # Skipping again on that backdated stamp double-counts the same
+        # latency -- measured here against a real team container it ate 11
+        # of 16 rows on top of the client's own 4, leaving one usable row.
+        # issued_at is still the right thing to judge STALENESS with; it is
+        # just not an amount to re-skip by.
+        age = max(time.time() - chunk.issued_at, 0.0) if chunk.issued_at else 0.0
+        if args.max_chunk_age_s and age > args.max_chunk_age_s:
+            stats.stale += 1
+            if args.verbose:
+                print(f"[adapter] dropping chunk {age * 1000:.0f}ms old "
+                      f"(> {args.max_chunk_age_s * 1000:.0f}ms)", file=sys.stderr)
+            continue
+
+        rows = chunk.actions
+        waypoints, times = [], []
+        t_solve = time.monotonic()
+        dt = 1.0 / args.chunk_hz
+        max_step = args.max_joint_vel * dt if args.max_joint_vel else None
+        res0 = None
+        raw_results = []
+        for i, row in enumerate(rows[:args.max_waypoints]):
+            res = solver.solve_row(row, body_q[:29])
+            if i == 0:
+                res0 = res
+            stats.waypoints += 1
+            stats.left_ok += int(res.left_ok)
+            stats.right_ok += int(res.right_ok)
+            raw_results.append(res)
+            # Mid-solve watchdog (2026-09-03) -- see the comment on
+            # KEEPALIVE_DEADLINE_S above. Checked after every waypoint, not
+            # just between chunks, because a slow chunk is exactly the case
+            # the existing zmq.Again-only keepalive can't see.
+            if (args.live and backend is not None and last_goal_template is not None
+                    and time.monotonic() - last_publish_time > KEEPALIVE_DEADLINE_S):
+                keep_goal = wbc_goal.build_goal(
+                    upper_body_waypoints=last_goal_template["upper_body"],
+                    target_time=[time.monotonic() + 1.0 / args.chunk_hz],
+                    base_height_command=last_goal_template["base_height"],
+                    navigate_cmd=last_goal_template["navigate_cmd"],
+                    wrist_pose=last_goal_template["wrist_pose"],
+                )
+                backend.publish_goal(keep_goal)
+                keepalives_sent += 1
+                last_publish_time = time.monotonic()
+        solve_s = time.monotonic() - t_solve
+        stats.solve_ms += solve_s * 1000.0
+
+        # 2026-08-25: clamp against a FRESH state read, taken AFTER solving,
+        # not the body_q read before the solve loop started. The solve loop
+        # above can legitimately take tens of ms (both arms, up to
+        # max_iters each, across up to --max-waypoints rows) -- lowering
+        # max_iters (200->100, same day) shrank this but could not zero it,
+        # because it was never really an iteration-count problem: ANY
+        # nonzero solve time means the real robot keeps moving (tracking
+        # whatever the PREVIOUS goal was) while our clamp anchor sits
+        # frozen at a pose that's now stale by exactly that amount. The
+        # clamp then bounds our own commanded sequence to small steps
+        # relative to that stale anchor -- but says nothing about the jump
+        # from wherever the robot ACTUALLY is (by publish time) to wherever
+        # our first "clamped" waypoint claims to start from. That jump is
+        # completely unbounded, and grows with solve time -- exactly why
+        # violations correlated with slow solves (5ms/waypoint -> 35-40ms
+        # right before each of the last two) without max_iters alone fixing
+        # it. Re-fetching state here, as close to publish time as this
+        # process can get, and anchoring the clamp to THAT instead closes
+        # the actual gap rather than the solve-time symptom of it. Lane/
+        # policy-agnostic -- this touches only the clamp, not IK itself, so
+        # it applies identically to GR00T-based teams using the sonic or
+        # decoupled lane through this same adapter, not just ARS.
+        fresh_body_q = body_q
+        if state_sub is not None:
+            fresh_q = state_sub.get_body_q()
+            if fresh_q is not None:
+                fresh_body_q = fresh_q
+        elif backend is not None:
+            fresh_q = backend.get_robot_q()
+            if fresh_q is not None:
+                fresh_body_q = fresh_q
+
+        for i, res in enumerate(raw_results):
+            # res.upper_body[:14] is always [left arm(7), right arm(7)], in
+            # the same order as body_q[15:29] -- see ik.py's _BODY_Q_NAMES.
+            # Waist/hand slots are already held at measured values (ik.py's
+            # own waist passthrough; mapper.build_waypoint's for hands), so
+            # only the arm portion can ever jump and needs clamping here.
+            arms = res.upper_body[:14].copy()
+            if max_step is not None:
+                if i == 0:
+                    last_commanded_arms = np.asarray(fresh_body_q[15:29], dtype=np.float64)
+                arms = last_commanded_arms + np.clip(
+                    arms - last_commanded_arms, -max_step, max_step)
+                last_commanded_arms = arms
+
+            if mapper is not None:
+                # arm slots replaced; hands/waist pass through as measured
+                waypoints.append(mapper.build_waypoint(
+                    fresh_body_q, arms[0:7], arms[7:14]))
+            else:
+                out = res.upper_body.copy()
+                out[:14] = arms
+                waypoints.append(out)
+
+        if not waypoints:
+            continue
+
+        # Schedule from now, after our own solve cost -- the only latency
+        # this adapter is entitled to compensate for is the one it adds.
+        t_base = time.monotonic()
+        times = [t_base + (i + 1) / args.chunk_hz for i in range(len(waypoints))]
+
+        n = len(waypoints)
+        goal = wbc_goal.build_goal(
+            upper_body_waypoints=np.asarray(waypoints),
+            target_time=times,
+            # per-waypoint, straight off each row -- not just row 0
+            base_height_command=[[float(r[21])] for r in rows[:n]],
+            navigate_cmd=[np.asarray(r[18:21], dtype=np.float64) for r in rows[:n]],
+            wrist_pose=np.concatenate([rows[0][4:7], rows[0][7:11],
+                                       rows[0][11:14], rows[0][14:18]]),
+        )
+
+        if backend is not None:
+            backend.publish_goal(goal)
+            stats.published += 1
+            last_publish_time = time.monotonic()
+            # Hold-position template for a keepalive if the next real
+            # chunk is slow to arrive -- last waypoint reached, single-row.
+            last_goal_template = {
+                "upper_body": waypoints[-1],
+                "base_height": [float(rows[n - 1][21])],
+                "navigate_cmd": np.asarray(rows[n - 1][18:21], dtype=np.float64),
+                "wrist_pose": np.concatenate([rows[0][4:7], rows[0][7:11],
+                                              rows[0][11:14], rows[0][14:18]]),
+            }
+
+        # boundary/actions.py: cols [0:2] left hand, [2:4] right hand,
+        # -1 open .. +1 closed, both columns of a pair duplicated.
+        if dex1_pub is not None:
+            dex1_pub.send(b"dex1" + _mp.packb(
+                {"left": float(rows[0][0]), "right": float(rows[0][2])},
+                use_bin_type=True))
+            stats.gripper_sent += 1
+
+        if args.verbose:
+            # Diagnostic for the frame/offset question (ik.py's own header):
+            # the (T,25) contract never states which point on the hand the
+            # position means or in what frame -- these are the RAW targets
+            # the policy is actually outputting, right off the wire,
+            # so their physical plausibility (reach length, not embedded in
+            # the robot, tracking the scene over time) can be eyeballed
+            # directly rather than only inferred from IK's own residual.
+            print(f"[adapter] would publish {len(waypoints)} waypoints in "
+                  f"{solve_s * 1000:.0f}ms (chunk age {age * 1000:.0f}ms), "
+                  f"base_h={goal['base_height_command'][0][0]:.3f}, "
+                  f"upper_body[0]={np.round(waypoints[0], 3)}")
+            if res0 is not None:
+                print(f"[adapter] row0 RAW targets (pelvis frame, ik.py's "
+                      f"assumption) -- "
+                      f"left_pos={np.round(rows[0][4:7], 3)} "
+                      f"left_quat={np.round(rows[0][7:11], 3)} "
+                      f"left_err={res0.left_err:.4f} left_ok={res0.left_ok} | "
+                      f"right_pos={np.round(rows[0][11:14], 3)} "
+                      f"right_quat={np.round(rows[0][14:18], 3)} "
+                      f"right_err={res0.right_err:.4f} right_ok={res0.right_ok} | "
+                      f"left_hand={rows[0][0]:.3f} right_hand={rows[0][2]:.3f} "
+                      f"(-1=open, +1=closed)")
+
+        if time.monotonic() - last_report > 2.0:
+            print(stats.report() + f" | {keepalives_sent} keepalives")
+            last_report = time.monotonic()
+
+
+_COMMAND_HEADER_SIZE = 1280  # must match ZMQPackedMessageSubscriber::HEADER_SIZE
+
+
+def _pack_command(*, start: bool, stop: bool, planner: bool) -> bytes:
+    """Build a gear_sonic_deploy 'command'-topic message.
+
+    Byte-for-byte the same wire format as the deploy's own reference
+    publisher (tests/test_zmq_manager.py ZMQPublisher.send_command) --
+    topic + a JSON header padded to _COMMAND_HEADER_SIZE + packed u8 data,
+    all as one message. Needed because operator_state.start is the only
+    way g1_deploy_onnx_ref's Control() state machine ever leaves
+    WAIT_FOR_CONTROL (see InitControl()/Control() switch in
+    g1_deploy_onnx_ref.cpp) -- without sending this, the deploy sits
+    healthy-looking and idle forever, never reaching CONTROL, never
+    running CreatePolicyCommand, no matter how many pose frames we relay.
+    Found and fixed 2026-09-17, after an earlier sonic-lane sim session
+    proved everything up to this point but ran out of time before wiring
+    this in.
+    """
+    header = {
+        "v": 1, "endian": "le", "count": 1,
+        "fields": [
+            {"name": "start", "dtype": "u8", "shape": [1]},
+            {"name": "stop", "dtype": "u8", "shape": [1]},
+            {"name": "planner", "dtype": "u8", "shape": [1]},
+        ],
+    }
+    header_bytes = json.dumps(header).encode("utf-8")
+    header_bytes += b"\x00" * (_COMMAND_HEADER_SIZE - len(header_bytes))
+    data = struct.pack("BBB", int(start), int(stop), int(planner))
+    return b"command" + header_bytes + data
+
+
+def run_sonic(args, sub: zmq.Socket, stats: Stats):
+    """Relay protocol-v4 pose frames straight through to gear_sonic_deploy.
+
+    The organizer's sonic frame and the deploy's input frame are the same
+    bytes (verified: `pose` topic, 1280B header, identical field set), so
+    this forwards the ORIGINAL message rather than re-packing it -- no
+    chance of a re-encode drifting from what the team actually published.
+    """
+    out = None
+    if args.live:
+        ctx = zmq.Context.instance()
+        # Socket type CONFIRMED 2026-09-04: PUB is right. The deploy's own
+        # reference publisher (tests/test_zmq_manager.py:26) is a zmq.PUB,
+        # and its subscriber is a SUB, so PUB/SUB is the matched pair.
+        out = ctx.socket(zmq.PUB if args.sonic_socket == "pub" else zmq.PUSH)
+        out.setsockopt(zmq.LINGER, 0)
+        # WE BIND, the deploy dials in. Verified 2026-09-04 against
+        # gear_sonic_deploy's own code, not assumed: its
+        # ZMQPackedMessageSubscriber::Connect() calls socket_->connect()
+        # (zmq_packed_message_subscriber.hpp:202), and BOTH of its reference
+        # publishers bind -- tests/test_zmq_manager.py:28 (host default "*")
+        # and tests/zmq_pose_subscriber_test.cpp:28. This previously called
+        # connect() on both ends, which ZMQ accepts silently while delivering
+        # nothing: no error, no warning, just zero frames through.
+        out.bind(f"tcp://*:{args.sonic_port}")
+        print(f"[adapter] relaying pose frames on "
+              f"tcp://*:{args.sonic_port} ({args.sonic_socket}, we bind; "
+              f"start gear_sonic_deploy with --zmq-port {args.sonic_port})")
+
+        # ZMQ's "slow joiner" behavior: messages sent on a PUB immediately
+        # after bind can be dropped if no SUB has connected yet. The
+        # deploy's own reference publisher sleeps 0.5s after bind for the
+        # same reason (tests/test_zmq_manager.py:32) -- match it here
+        # since the start command below is exactly the kind of one-shot
+        # message slow-joiner drops would silently eat.
+        time.sleep(0.5)
+
+        # planner=False: sonic-lane teams stream pose frames from
+        # their OWN external policy (this relay's whole job); gear_sonic_
+        # deploy's internal planner is a different, unused input mode
+        # (--input-type zmq_manager --planner-file ..., not --input-type
+        # zmq). Sending planner=True here would ask the deploy to run a
+        # planner nobody configured.
+        out.send(_pack_command(start=True, stop=False, planner=False))
+        print("[adapter] sent command(start=1, stop=0, planner=0) -- "
+              "this is the ONLY thing that moves gear_sonic_deploy out of "
+              "WAIT_FOR_CONTROL. Without it, everything looks healthy "
+              "(connected, 0 rejected) but CreatePolicyCommand() never runs.")
+    else:
+        print("[adapter] DRY-RUN -- validating pose frames, relaying nothing.")
+
+    last_report = time.monotonic()
+    try:
+        while True:
+            try:
+                msg = sub.recv()
+            except zmq.Again:
+                print("[adapter] no actions on :5556 yet (is the team's Orin client up?)")
+                continue
+            if not msg.startswith(POSE_TOPIC):
+                continue
+
+            stats.messages += 1
+            try:
+                problems = validate_pose(decode_pose(msg))
+            except Exception as exc:
+                stats.rejected += 1
+                print(f"[adapter] undecodable pose frame: {exc}", file=sys.stderr)
+                continue
+            if problems:
+                stats.rejected += 1
+                print(f"[adapter] REJECTED pose: {'; '.join(problems)}", file=sys.stderr)
+                continue
+
+            if out is not None:
+                out.send(msg)          # original bytes, deliberately not re-packed
+                stats.published += 1
+
+            if time.monotonic() - last_report > 2.0:
+                print(stats.report())
+                last_report = time.monotonic()
+    except KeyboardInterrupt:
+        if out is not None:
+            # Graceful stop signal on clean shutdown. NOT a safety
+            # mechanism -- the independent e-stop is what actually stops
+            # the robot regardless of whether this fires (see --live's own
+            # banner above). This just tells the deploy to stop cleanly
+            # rather than leaving it mid-CONTROL when this process exits.
+            out.send(_pack_command(start=False, stop=True, planner=False))
+            print("[adapter] sent command(stop=1) before exiting")
+        raise
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    p.add_argument("--lane", required=True, choices=LANES,
+                   help="must match the team's manifest.yaml")
+    p.add_argument("--actions-host", default="127.0.0.1",
+                   help="where the team's client bound :5556 (its own host)")
+    p.add_argument("--actions-port", type=int, default=5556)
+    p.add_argument("--live", action="store_true",
+                   help="actually drive the robot. Default: dry-run.")
+    p.add_argument("--engage-policy", action="store_true",
+                   help="2026-09-14: send {'toggle_policy_action': True} once, "
+                        "as soon as the WBC's own state topic is confirmed live. "
+                        "Without this, G1GearWbcPolicy.use_policy_action stays at "
+                        "its constructor default (False) for the entire run -- "
+                        "NVIDIA's own teleop safe-mode, which holds the robot's "
+                        "current measured joint position every tick rather than "
+                        "running the trained RL balance policy. Looks completely "
+                        "healthy (WBC up, topics ticking at 50Hz, this adapter "
+                        "publishing with 0 rejected) while never actually engaging "
+                        "balance -- found by decoding "
+                        "/ControlPolicy/lower_body_policy_status directly, since "
+                        "nothing else in the stack surfaces this. Only meaningful "
+                        "with --live --wbc-backend ros2; ignored otherwise. This "
+                        "is a TOGGLE: sent exactly once per run, never repeated, "
+                        "since a second send would disengage it again.")
+    p.add_argument("--verbose", action="store_true")
+    # decoupled
+    p.add_argument("--wbc-backend", default="ros2", choices=("ros2", "zmq"),
+                   help="ros2 = the real Decoupled WBC; zmq = bench loopback")
+    p.add_argument("--upper-body-from-model", action="store_true",
+                   help="force querying decoupled_wbc's robot model for the "
+                        "upper-body layout (implied by --wbc-backend ros2)")
+    p.add_argument("--enable-waist", action="store_true",
+                   help="set iff run_g1_control_loop.py runs with waist in the "
+                        "upper-body group (width 17 vs 14)")
+    p.add_argument("--chunk-hz", type=float, default=20.0,
+                   help="cadence the (T,25) rows are meant to play out at")
+    p.add_argument("--max-waypoints", type=int, default=16)
+    p.add_argument("--max-joint-vel", type=float, default=1.0,
+                   help="rad/s cap on how fast any commanded arm joint may move "
+                        "between scheduled waypoints, regardless of what the raw "
+                        "IK solution implies. Margin under the WBC's own real-"
+                        "hardware joint safety monitor (+-6 rad/s, joint_safety.py) "
+                        "-- IK has no notion of the schedule's timing, so an "
+                        "unthrottled solve far from the current pose can exceed "
+                        "that limit and trip a hard shutdown. 0 disables. "
+                        "2026-08-25: lowered from 4.0 -- across four live "
+                        "violations this session, ACTUAL measured joint velocity "
+                        "reached up to 3.0x this commanded cap (12.03 rad/s "
+                        "actual vs a 4.0 cap), a real gap between commanded and "
+                        "realized motion this adapter doesn't fully explain yet "
+                        "(clamp-reference staleness fixes reduced but did not "
+                        "eliminate it). "
+                        "2026-09-03: lowered again, 2.0 -> 1.0. One team's "
+                        "session tripped right_elbow_joint at -7.153 (WBC's own "
+                        "reported figure) to -7.706 rad/s (independently "
+                        "recomputed from capture_evidence.py's raw body_q "
+                        "samples, ~20ms apart) against a 2.0 commanded cap -- "
+                        "~3.6-3.9x amplification, WORSE than the 3.0x this "
+                        "comment already flagged as unexplained, not better. "
+                        "Ruled out: the already-documented unclamped path (WBC's "
+                        "own >1.0s teleop-timeout injecting an unclamped safe "
+                        "goal) -- no 'Teleop mode timeout' line anywhere near "
+                        "this violation in the WBC log, so this went through "
+                        "our own solve->clamp->publish path, not around it. "
+                        "target_time spacing was also checked and matches the "
+                        "dt this clamp assumes (times = t_base + (i+1)/chunk_hz, "
+                        "same chunk_hz used for max_step), so it isn't a simple "
+                        "units/timing mismatch either. Real body_q samples show "
+                        "the joint smoothly RISING for ~360ms right before the "
+                        "trip, then reversing hard within one ~23ms sample -- "
+                        "consistent with (not proven as) a position-only clamp "
+                        "saying nothing about the arm's existing momentum when a "
+                        "reversal is commanded, so tracking a same-magnitude "
+                        "position step in the opposite direction of travel can "
+                        "demand more real velocity than the step size alone "
+                        "implies. Since the amplification factor itself is "
+                        "trending worse with each measurement, not converging, "
+                        "1.0 buys real margin against that uncertainty rather "
+                        "than assuming 3x again: even at this session's ~3.9x, "
+                        "worst case lands ~3.9 rad/s, clear of the 6.0 limit. "
+                        "The amplification mechanism is still not understood -- "
+                        "this is a mitigation, not a fix for the root cause.")
+    p.add_argument("--max-ik-err", type=float, default=1e-3)
+    p.add_argument("--ik-warm-start", default="current", choices=("current", "last"),
+                   help="'current' (default) seeds IK from the measured arm pose "
+                        "every solve -- deterministic, reproducible, required for "
+                        "scored attempts. 'last' seeds from the previous solution: "
+                        "faster, but makes results depend on message order/timing.")
+    p.add_argument("--state-source", default="wbc",
+                   choices=("wbc", "boundary", "zeros"),
+                   help="where real body_q comes from. 'wbc' = the WBC's own "
+                        "state topic (authoritative, needs --live/ros2). "
+                        "'boundary' = the organizer's :5557 endpoint, which "
+                        "lets a dry run measure against the real arm with no "
+                        "WBC at all. 'zeros' = plumbing smoke test only.")
+    p.add_argument("--orin-host", default="127.0.0.1",
+                   help="host serving the organizer's :5555/:5557 endpoints")
+    p.add_argument("--state-port", type=int, default=5557)
+    p.add_argument("--dex1-port", type=int, default=5599,
+                   help="where run_wbc_with_dex1.py listens for gripper "
+                        "targets. 0 disables (no grasp possible).")
+    p.add_argument("--dex1-host", default="127.0.0.1")
+    p.add_argument("--max-chunk-age-s", type=float, default=1.0,
+                   help="drop a chunk older than this (0 disables). Guards "
+                        "against acting on a stale plan after a stall.")
+    # sonic
+    p.add_argument("--sonic-host", default="127.0.0.1")
+    p.add_argument("--sonic-port", type=int, default=5580,
+                   help="gear_sonic_deploy's zmq input endpoint (--input-type "
+                        "zmq, NOT the default --input-type zmq_manager -- that "
+                        "one runs an internal planner nobody wants here). "
+                        "CONFIRMED 2026-09-04: g1_deploy_onnx_ref.cpp's own "
+                        "--zmq-port compiles in a default of 5556, same as "
+                        "the boundary's action port -- deploy.sh can't even "
+                        "pass --zmq-port through, so reaching this requires "
+                        "calling `just run g1_deploy_onnx_ref` directly with "
+                        "--zmq-port matching this flag. 5580 isn't special, "
+                        "just deliberately not 5555/5556/5557 (the organizer's "
+                        "camera/action/state ports) -- confirm whatever port "
+                        "gear_sonic_deploy is actually launched with matches "
+                        "this value exactly.")
+    p.add_argument("--sonic-socket", default="pub", choices=("pub", "push"))
+    args = p.parse_args()
+
+    print(f"[adapter] lane={args.lane} "
+          f"actions=tcp://{args.actions_host}:{args.actions_port} "
+          f"{'LIVE' if args.live else 'DRY-RUN'}")
+    if args.live:
+        print("=" * 70)
+        print("LIVE -- this drives the real robot. Confirm the robot is")
+        print("supported as your setup requires and the independent e-stop is")
+        print("staffed. This adapter is not a safety system; the e-stop is.")
+        print("=" * 70)
+        input("Press Enter to proceed, Ctrl+C to abort...")
+
+    sub = make_action_subscriber(args.actions_host, args.actions_port,
+                                 conflate=(args.lane == "decoupled"))
+    stats = Stats()
+    try:
+        if args.lane == "decoupled":
+            run_decoupled(args, sub, stats)
+        else:
+            run_sonic(args, sub, stats)
+    except KeyboardInterrupt:
+        print(f"\n[adapter] stopped. {stats.report()}")
+
+
+if __name__ == "__main__":
+    main()
