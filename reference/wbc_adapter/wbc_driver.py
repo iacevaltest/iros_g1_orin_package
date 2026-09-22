@@ -387,8 +387,29 @@ def run_decoupled(args, sub: zmq.Socket, stats: Stats):
         max_step = args.max_joint_vel * dt if args.max_joint_vel else None
         res0 = None
         raw_results = []
+        solve_failed = False
         for i, row in enumerate(rows[:args.max_waypoints]):
-            res = solver.solve_row(row, _q29(body_q))
+            try:
+                res = solver.solve_row(row, _q29(body_q))
+            except Exception as exc:
+                # Fail closed. The WBC keeps its last published goal; never
+                # terminate the adapter or publish a partially solved chunk.
+                #
+                # Reachable since the 43->29 indexing fix: before it, the
+                # right arm's seed was a constant zero vector, inside every
+                # limit, so pink's check_limits could not fire on that side.
+                # The seed is now the real measured pose, which can sit
+                # microscopically outside the limits ik.py narrows below the
+                # URDF -- 2026-09-21 aborted the process on 0.904509 against
+                # a +/-0.9 wrist_roll override, 0.26 degrees over.
+                stats.rejected += 1
+                solve_failed = True
+                print(
+                    f"[adapter] IK solve failed; holding last safe goal: "
+                    f"{type(exc).__name__}: {exc}",
+                    file=sys.stderr,
+                )
+                break
             if i == 0:
                 res0 = res
             stats.waypoints += 1
@@ -413,6 +434,8 @@ def run_decoupled(args, sub: zmq.Socket, stats: Stats):
                 last_publish_time = time.monotonic()
         solve_s = time.monotonic() - t_solve
         stats.solve_ms += solve_s * 1000.0
+        if solve_failed:
+            continue
 
         # 2026-08-25: clamp against a FRESH state read, taken AFTER solving,
         # not the body_q read before the solve loop started. The solve loop
