@@ -516,9 +516,28 @@ def run_decoupled(args, sub: zmq.Socket, stats: Stats):
             stats.published += 1
             last_publish_time = time.monotonic()
             # Hold-position template for a keepalive if the next real
-            # chunk is slow to arrive -- last waypoint reached, single-row.
+            # chunk is slow to arrive.
+            #
+            # 2026-09-23: was waypoints[-1], the FARTHEST-FUTURE waypoint of
+            # the chunk. Only ~2-3 of a chunk's 8 waypoints ever execute
+            # before the next chunk supersedes the schedule, so the last one
+            # sits up to ~0.5 rad (29 deg) beyond where the arm actually is.
+            # Republishing that with a 0.1s deadline demands ~5 rad/s, clipped
+            # only by the WBC's own 3.0 rad/s ceiling -- a ~172 deg/s lunge
+            # lasting ~0.17s. The 2026-09-21 run fired 40 keepalives inside
+            # one 16.5s window (in a stretch where IK accept was 98-102%, so
+            # nothing else was wrong), which is 2-3 such lunges per second and
+            # matches the jerking seen at the bench.
+            #
+            # waypoints[0] is the NEAREST waypoint -- already clamped to
+            # within max_step of the measured pose when the chunk was built --
+            # so a keepalive now holds roughly where the arm is instead of
+            # yanking it to where the chunk was going to end up.
+            #
+            # base_height/navigate_cmd deliberately still come from row n-1:
+            # they are not arm motion and were not implicated.
             last_goal_template = {
-                "upper_body": waypoints[-1],
+                "upper_body": waypoints[0],
                 "base_height": [float(rows[n - 1][21])],
                 "navigate_cmd": np.asarray(rows[n - 1][18:21], dtype=np.float64),
                 "wrist_pose": np.concatenate([rows[0][4:7], rows[0][7:11],

@@ -226,7 +226,29 @@ class IKSettings:
     # joint is effectively unbounded near this target, so it just uses
     # whatever range is available; capping it steers toward the same
     # solution the real WBC's own execution converges to instead.
-    wrist_roll_limit_override: float = 0.9
+    #
+    # 2026-09-23: DISABLED as a hard limit (was 0.9) and replaced by the
+    # posture weight below. Measured over 80 episodes / 1,111,925 frames of
+    # the official dataset's per-episode `action.robot_q_desired` stats:
+    # |wrist_roll| > 0.9 occurs in 71/80 episodes (88.8%) on the left arm and
+    # 65/80 (81.2%) on the right, and in 45/80 (56.2%) / 28/80 (35.0%) of
+    # episodes for MORE than 1% of that episode's frames. Individual episodes
+    # reach the mechanical stop exactly (1.9722). A HARD limit makes every one
+    # of those poses infeasible -- the solve is rejected outright, which is
+    # what produced a ~19.9s block of 0% right-arm accept on 2026-09-21.
+    # The note above says the cap's purpose was to "steer toward the same
+    # solution the real WBC's own execution converges to"; a posture weight
+    # does exactly that without forbidding anything. Set a float here to
+    # restore the old hard-limit behaviour.
+    #
+    # The elbow override above is NOT changed: the same measurement shows it
+    # costs nothing (0/80 episodes left, 4/80 right, none for as much as 1%
+    # of an episode).
+    wrist_roll_limit_override: float | None = None
+    # Posture weight for wrist_roll, overriding _ARM_POSTURE_WEIGHTS (1.0,
+    # NVIDIA's unlisted-joint default). Higher = pulled harder toward the
+    # seed, i.e. steered away from large rolls without being forbidden one.
+    wrist_roll_posture_weight: float = 4.0
 
 
 class PinkArmIK:
@@ -276,8 +298,9 @@ class PinkArmIK:
 
         wrist_roll_joint = f"{side}_wrist_roll_joint"
         wc = settings.wrist_roll_limit_override
-        self.model.upperPositionLimit[self.q_index[wrist_roll_joint]] = wc
-        self.model.lowerPositionLimit[self.q_index[wrist_roll_joint]] = -wc
+        if wc is not None:
+            self.model.upperPositionLimit[self.q_index[wrist_roll_joint]] = wc
+            self.model.lowerPositionLimit[self.q_index[wrist_roll_joint]] = -wc
         self.last_iters = 0
         self._cached_target_pos: np.ndarray | None = None
         self._cached_target_quat: np.ndarray | None = None
@@ -378,7 +401,11 @@ class PinkArmIK:
         weights = np.ones(reduced.nq)
         for name in ARM_JOINTS[self.side]:
             key = name.replace(f"{self.side}_", "", 1).replace("_joint", "")
-            weights[r_index[name]] = _ARM_POSTURE_WEIGHTS[key]
+            w = _ARM_POSTURE_WEIGHTS[key]
+            if key == "wrist_roll":
+                # Steer instead of forbid -- see wrist_roll_limit_override.
+                w = self.settings.wrist_roll_posture_weight
+            weights[r_index[name]] = w
         WeightedPostureTask = _get_weighted_posture_task_cls(pink)
         posture = WeightedPostureTask(cost=self.settings.posture_cost,
                                        weights=weights,
