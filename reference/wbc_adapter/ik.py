@@ -353,6 +353,17 @@ class PinkArmIK:
             for name in ARM_JOINTS[self.side]:
                 q_red[r_index[name]] = q_full[self.q_index[name]]
 
+        # The measured robot pose can sit a few milliradians outside a
+        # solver-side limit (notably the 0.9 rad wrist-roll override). Pink
+        # rejects such a seed before taking an IK step. Project only the seed
+        # into the reduced model's valid interval; the measured state and the
+        # commanded target remain unchanged.
+        margin = 1e-6
+        lower = np.asarray(reduced.lowerPositionLimit, dtype=np.float64)
+        upper = np.asarray(reduced.upperPositionLimit, dtype=np.float64)
+        q_red = np.maximum(q_red, np.where(np.isfinite(lower), lower + margin, lower))
+        q_red = np.minimum(q_red, np.where(np.isfinite(upper), upper - margin, upper))
+
         cfg = pink.Configuration(reduced, r_data, q_red)
         task = pink.FrameTask(self.wrist_frame,
                               position_cost=self.settings.hand_position_cost,
