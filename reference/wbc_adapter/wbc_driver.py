@@ -688,6 +688,70 @@ def run_sonic(args, sub: zmq.Socket, stats: Stats):
         raise
 
 
+def _refuse_incompatible_state_source(args):
+    """Refuse to launch on a --state-source the upper-body mapper cannot use.
+
+    Two consumers want different widths out of the same vector. ik.py wants
+    the 29-wide Unitree body layout. UpperBodyMapper indexes the WBC's own
+    model, whose upper_body group runs up to model index 42, so it needs the
+    full 43-wide q. --state-source boundary (:5557) and --state-source zeros
+    both deliver 29.
+
+    Left unchecked this is not a startup failure -- it is accepted, the robot
+    is engaged, and then the FIRST chunk dies inside
+    UpperBodyMapper.current_upper_body() with
+
+        ValueError: robot state q has 29 entries but upper_body indexes up to 42
+
+    which is correct but arrives a second too late and reads like a mystery.
+    Everything needed to rule it out is present the moment argv is parsed, so
+    rule it out here, loudly, before anything connects to a robot.
+    """
+    if args.lane != "decoupled":
+        return
+    if args.state_source not in ("boundary", "zeros"):
+        return
+    if args.upper_body_from_model:
+        why = "--upper-body-from-model was passed explicitly"
+    elif args.live and args.wbc_backend == "ros2":
+        why = "--live --wbc-backend ros2 implies --upper-body-from-model"
+    else:
+        return
+
+    print("=" * 70, file=sys.stderr)
+    print("LAUNCH DENIED -- incompatible options. Nothing was started and the",
+          file=sys.stderr)
+    print("robot was not contacted.", file=sys.stderr)
+    print("", file=sys.stderr)
+    print(f"  You asked for : --state-source {args.state_source}", file=sys.stderr)
+    print(f"  Which implies : the robot state arrives 29 joints wide",
+          file=sys.stderr)
+    print(f"  But also      : {why}", file=sys.stderr)
+    print(f"  Which needs   : the WBC's own 43-wide model vector, because the",
+          file=sys.stderr)
+    print(f"                  upper_body group indexes up to model index 42",
+          file=sys.stderr)
+    print("", file=sys.stderr)
+    print("  Run it one of these two ways instead:", file=sys.stderr)
+    print("", file=sys.stderr)
+    print("    Drive the robot for real -- drop --state-source and let it",
+          file=sys.stderr)
+    print("    default to 'wbc', which is the 43-wide source the mapper needs:",
+          file=sys.stderr)
+    print(f"      --lane decoupled --live --wbc-backend ros2", file=sys.stderr)
+    print("", file=sys.stderr)
+    print(f"    Measure against the real arm with no WBC -- keep",
+          file=sys.stderr)
+    print(f"    --state-source {args.state_source} and drop --live and",
+          file=sys.stderr)
+    print("    --upper-body-from-model, so no robot model is loaded at all:",
+          file=sys.stderr)
+    print(f"      --lane decoupled --state-source {args.state_source} --verbose",
+          file=sys.stderr)
+    print("=" * 70, file=sys.stderr)
+    raise SystemExit(2)
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument("--lane", required=True, choices=LANES,
@@ -719,7 +783,11 @@ def main():
                    help="ros2 = the real Decoupled WBC; zmq = bench loopback")
     p.add_argument("--upper-body-from-model", action="store_true",
                    help="force querying decoupled_wbc's robot model for the "
-                        "upper-body layout (implied by --wbc-backend ros2)")
+                        "upper-body layout (implied by --live --wbc-backend "
+                        "ros2). Requires --state-source wbc (the default): "
+                        "the mapper indexes up to model index 42, which the "
+                        "29-wide 'boundary' and 'zeros' sources cannot "
+                        "provide. The combination is refused at startup.")
     p.add_argument("--enable-waist", action="store_true",
                    help="set iff run_g1_control_loop.py runs with waist in the "
                         "upper-body group (width 17 vs 14)")
@@ -783,7 +851,12 @@ def main():
                         "state topic (authoritative, needs --live/ros2). "
                         "'boundary' = the organizer's :5557 endpoint, which "
                         "lets a dry run measure against the real arm with no "
-                        "WBC at all. 'zeros' = plumbing smoke test only.")
+                        "WBC at all. 'zeros' = plumbing smoke test only. "
+                        "INCOMPATIBLE with the upper-body mapper: 'boundary' "
+                        "and 'zeros' are 29 joints wide, while the mapper "
+                        "indexes the WBC's model up to index 42 and needs the "
+                        "43-wide 'wbc' source. Combining them is refused at "
+                        "startup -- see --upper-body-from-model.")
     p.add_argument("--orin-host", default="127.0.0.1",
                    help="host serving the organizer's :5555/:5557 endpoints")
     p.add_argument("--state-port", type=int, default=5557)
@@ -812,6 +885,7 @@ def main():
                         "this value exactly.")
     p.add_argument("--sonic-socket", default="pub", choices=("pub", "push"))
     args = p.parse_args()
+    _refuse_incompatible_state_source(args)
 
     print(f"[adapter] lane={args.lane} "
           f"actions=tcp://{args.actions_host}:{args.actions_port} "
