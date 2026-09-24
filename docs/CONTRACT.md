@@ -147,16 +147,16 @@ waypoint is due, it holds that final pose. Same on both lanes.
 
 | Clamp | Source | Setting |
 |---|---|---|
-| position | the controller's own robot model: the URDF limits plus the WBC's supplemental narrowing (`shoulder_roll` is kept 0.19 rad from the torso) — the same table its joint safety monitor enforces on the real robot. Read from the model, never typed in; a 1e-3 rad margin keeps commands off the exact edge. | `--joint-lane-limits urdf` (default) |
-| position, IK-parity | the above plus the two overrides the organizer's IK solver applies to itself (`elbow ≤ 1.4`, `wrist_roll` within `±0.9`). Those exist to steer a redundant IK solution, not to protect hardware, so they are **not** applied to joint-space policies unless ruled. | `--joint-lane-limits ik` |
+| position | the **raw URDF limits** of `g1_29dof_with_hand.urdf` — the model file both the controller and the organizer's IK load — read off the loaded model, never typed in; a 1e-3 rad margin keeps commands off the exact edge. Left `shoulder_roll` is `[-1.588, 2.252]`, right is the mirror `[-2.252, 1.588]`, elbow `[-1.047, 2.094]`, wrist_roll `±1.972`. The controller's own model additionally narrows `shoulder_roll` to 0.19 rad from the torso, but nothing on the robot enforces that (its safety monitor treats position violations as warnings only) and the `decoupled` lane's IK ranges over the raw URDF too, so the joint lane does the same. | `--joint-lane-limits urdf` (default) |
+| position, IK-parity | the same raw URDF limits plus the two overrides the organizer's IK solver applies to itself (`elbow ≤ 1.4`, `wrist_roll` within `±0.9`) — exactly what the `decoupled` lane's solver enforces. Those exist to steer a redundant IK solution, not to protect hardware, so they are **not** applied to joint-space policies unless ruled. | `--joint-lane-limits ik` |
 | step | `--max-joint-vel` (1.0 rad/s) at `--chunk-hz` (20 Hz): 0.05 rad per row | as `decoupled` |
 
 Every clamp larger than 0.01 rad is counted in the adapter's `[stats]`
 line, and the first such clamp of each joint is logged with the value and
-the limit; smaller trims are applied silently (the controller's own model
-narrows `shoulder_roll` to 0.19 rad while the rest pose measures 0.1875, so
-echoing the measured pose would otherwise count as a clamp on every row).
-The counter reports out-of-range **intent**, not sub-centiradian trims. A
+the limit; smaller trims are applied silently (a measured pose echoed
+back can sit a few milliradians past a limit and would otherwise count as
+a clamp on every row). The counter reports out-of-range **intent**, not
+sub-centiradian trims. A
 policy that is clamped often is a policy commanding outside the robot's
 range — that is visible in your own published rows, and it is yours.
 

@@ -89,10 +89,10 @@ GOTO_MAX_DURATION_S = 15.0
 # refreshing; the whole remaining trajectory does not.
 KEEPALIVE_WINDOW_S = 2.0
 # A position clamp smaller than this is applied but neither counted nor
-# logged. The WBC's own model narrows shoulder_roll to +-0.19 rad while the
-# rest pose measures 0.1875, so echoing the measured pose is "clamped" by
-# 2.5 mrad on every row; the counter is meant to report out-of-range
-# INTENT, not sub-centiradian trims.
+# logged: a measured pose echoed back can sit a few milliradians past a
+# limit (sensor offset, the 1e-3 margin) and would otherwise be "clamped"
+# on every row; the counter is meant to report out-of-range INTENT, not
+# sub-centiradian trims.
 CLAMP_REPORT_THRESHOLD_RAD = 1e-2
 
 
@@ -212,16 +212,21 @@ class ArmLimits:
     Unitree G1JointIndex order -- the order the joint lane's rows, ik.py's
     `_BODY_Q_NAMES[15:29]` and `UpperBodyMapper.build_waypoint` all share.
 
-    Read from the robot model, never typed in. `--joint-lane-limits urdf`
-    uses the limits exactly as the WBC's own RobotModel loads them: the
-    URDF, plus the WBC's own supplemental narrowing (shoulder_roll is kept
-    away from the torso, +-0.19 rad, in g1_supplemental_info.py). Those are
-    the same arrays the WBC's JointSafetyMonitor enforces on the real robot,
-    so a command that passes this clamp is one the WBC will not trip on.
-    `ik` additionally applies ik.py's solver-side overrides (elbow upper
-    bound, symmetric wrist_roll cap) so both lanes range over the same
-    joint space -- off by default because those overrides exist to steer a
-    redundant IK solution, not to protect hardware; see docs/CONTRACT.md.
+    Read from the robot model file, never typed in. `--joint-lane-limits
+    urdf` is the RAW URDF limits of g1_29dof_with_hand.urdf -- the file
+    both the WBC's RobotModel and ik.py load -- taken off the pinocchio
+    model, NOT the RobotModel's supplemental-narrowed arrays. That model
+    narrows shoulder_roll to +-0.19 rad (g1_supplemental_info.py), but
+    nothing on the robot enforces it: JointSafetyMonitor treats position
+    violations as warnings only (joint_safety.py, critical False, and the
+    print is commented out), and the pose lane's IK ranges over the raw
+    URDF; clamping to it only trimmed every echoed row of a raised arm
+    (measured 0.173-0.176) and logged it. `ik` additionally applies ik.py's
+    solver-side overrides (elbow upper bound, symmetric wrist_roll cap),
+    read from IKSettings -- exactly what PinkArmIK enforces -- so both
+    lanes range over the same joint space; off by default because those
+    overrides exist to steer a redundant IK solution, not to protect
+    hardware; see docs/CONTRACT.md.
     """
 
     MARGIN = 1e-3   # rad inside the limit, so the WBC never sees an exact edge
@@ -248,19 +253,21 @@ class ArmLimits:
 def _load_arm_limits(mode: str, mapper, ik_settings) -> ArmLimits:
     """Arm joint limits for the joint lane's position clamp -- see ArmLimits.
 
-    With a mapper the WBC's own RobotModel is the source (that is the model
-    the goal is ultimately executed against). Without one (bench dry-run,
-    no decoupled_wbc installed) the same URDF ik.py solves against is read
-    with pinocchio directly, which carries no supplemental narrowing.
+    Always the raw URDF's numbers. With a mapper they come off the
+    pinocchio model already loaded inside the WBC's RobotModel (its
+    `pinocchio_wrapper.model`, untouched by the supplemental overrides the
+    RobotModel applies to its own limit arrays). Without one (bench
+    dry-run, no decoupled_wbc installed) the same URDF ik.py solves
+    against is read with pinocchio directly.
     """
     from ik import ARM_JOINTS, DEFAULT_URDF
     names = list(ARM_JOINTS["left"]) + list(ARM_JOINTS["right"])
     if mapper is not None:
-        model = mapper.model
-        idx = [model.joint_to_dof_index[n] for n in names]
-        lower = np.asarray(model.lower_joint_limits, dtype=np.float64)[idx]
-        upper = np.asarray(model.upper_joint_limits, dtype=np.float64)[idx]
-        source = "WBC robot model"
+        model = mapper.model.pinocchio_wrapper.model
+        idx = [model.joints[model.getJointId(n)].idx_q for n in names]
+        lower = np.asarray(model.lowerPositionLimit, dtype=np.float64)[idx]
+        upper = np.asarray(model.upperPositionLimit, dtype=np.float64)[idx]
+        source = "URDF (WBC robot model's pinocchio model)"
     else:
         import pinocchio as pin
         model = pin.buildModelFromUrdf(str(DEFAULT_URDF))
@@ -1417,18 +1424,7 @@ def build_parser() -> argparse.ArgumentParser:
                         "b'taskspace'. The taskspace path is unaffected either "
                         "way. 'off' ignores both topics like any unknown prefix.")
     p.add_argument("--joint-lane-limits", default="urdf", choices=("urdf", "ik"),
-                   help="which position limits the joint lane clamps arm angles "
-                        "to (never typed in; read from the robot model). 'urdf' "
-                        "(default) = the limits exactly as the WBC's own robot "
-                        "model loads them -- the URDF plus the WBC's supplemental "
-                        "narrowing (shoulder_roll kept +-0.19 rad from the "
-                        "torso), i.e. the same table its JointSafetyMonitor "
-                        "enforces on the real robot. 'ik' additionally applies "
-                        "ik.py's solver-side overrides (elbow upper bound 1.4, "
-                        "wrist_roll +-0.9) so the joint lane ranges over the "
-                        "same space the taskspace lane's IK does; those exist "
-                        "to steer a redundant solution, not to protect hardware, "
-                        "so they are not the default. Switch if ruled.")
+                   help="which position limits the joint lane clamps arm angles to (never typed in; read from the robot model file). 'urdf' (default) = the RAW URDF limits of g1_29dof_with_hand.urdf, the model both the WBC's robot model and ik.py load -- NOT the WBC RobotModel's supplemental-narrowed arrays (its 0.19 rad shoulder_roll narrowing is enforced by nothing on the robot: its JointSafetyMonitor treats position violations as warnings, and the pose lane's IK ranges over the raw URDF too). 'ik' = the same raw URDF limits plus ik.py's solver-side overrides (elbow upper bound 1.4, wrist_roll +-0.9, read from IKSettings) -- exactly what PinkArmIK enforces -- so the joint lane ranges over the same space the taskspace lane's IK does; those exist to steer a redundant solution, not to protect hardware, so they are not the default. Switch if ruled.")
     p.add_argument("--goto-max-speed", type=_positive_float, default=0.45,
                    help="rad/s ceiling on a b'goto' request's own max_speed; "
                         "must be > 0 (--joint-lane off is the switch, not 0). "

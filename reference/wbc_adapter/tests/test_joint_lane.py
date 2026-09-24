@@ -353,15 +353,70 @@ class JointStepClamp(unittest.TestCase):
 
 
 class JointPositionClamp(unittest.TestCase):
-    def test_limits_come_from_the_robot_model(self):
+    def test_limits_are_the_raw_urdf_values(self):
+        import pinocchio as pin
         lim = wbc_driver._load_arm_limits("urdf", mapper(), solver().settings)
-        m = mapper().model
+        # the numbers must be the URDF's: re-read the file itself, independently
+        urdf, _ = _ik_urdf()
+        raw = pin.buildModelFromUrdf(str(urdf))
         for j, name in enumerate(lim.names):
-            idx = m.joint_to_dof_index[name]
-            self.assertEqual(lim.lower[j], m.lower_joint_limits[idx])
-            self.assertEqual(lim.upper[j], m.upper_joint_limits[idx])
+            q = raw.joints[raw.getJointId(name)].idx_q
+            self.assertEqual(lim.lower[j], raw.lowerPositionLimit[q], name)
+            self.assertEqual(lim.upper[j], raw.upperPositionLimit[q], name)
         self.assertEqual(lim.names[3], "left_elbow_joint")
         self.assertEqual(lim.names[10], "right_elbow_joint")
+        # NOT the WBC RobotModel's narrowed arrays: left shoulder_roll goes
+        # well below 0.19, right shoulder_roll is the mirrored URDF value
+        m = mapper().model
+        self.assertLess(lim.lower[1], 0.0)
+        self.assertGreater(m.lower_joint_limits[m.joint_to_dof_index["left_shoulder_roll_joint"]], 0.0)
+        np.testing.assert_allclose([lim.lower[1], lim.upper[1]], [-1.5882, 2.2515], atol=1e-4)
+        np.testing.assert_allclose([lim.lower[8], lim.upper[8]], [-2.2515, 1.5882], atol=1e-4)
+
+    def test_shoulder_roll_near_the_torso_passes_in_both_modes(self):
+        for mode in ("urdf", "ik"):
+            ctx = make_ctx(limits=mode, max_joint_vel=0)
+            rows = joint_rows(T=3)
+            rows[0, 5] = 0.10          # left shoulder_roll, inside the URDF, under the 0.19 narrowing
+            rows[1, 5] = 0.0
+            rows[2, 5] = 0.175         # the raised-arm measurement echoed back
+            rows[:, 12] = -0.10        # right shoulder_roll
+            with contextlib.redirect_stderr(io.StringIO()) as err:
+                wbc_driver._handle_joint(ctx, joint_msg(rows))
+            wps = ctx.backend.goals[0]["target_upper_body_pose"]
+            for t, wp in enumerate(wps):
+                self.assertAlmostEqual(wp[1], rows[t, 5], places=6, msg=mode)
+                self.assertAlmostEqual(wp[15], -0.10, places=6, msg=mode)
+            self.assertEqual(ctx.stats.joints_clamped, 0, mode)
+            self.assertEqual(err.getvalue(), "", mode)
+
+    def test_beyond_the_urdf_clamps_in_both_modes(self):
+        for mode in ("urdf", "ik"):
+            ctx = make_ctx(limits=mode, max_joint_vel=0)
+            rows = joint_rows(T=1)
+            rows[0, 5] = 2.4           # left shoulder_roll past 2.2515
+            rows[0, 12] = 1.7          # right shoulder_roll past its mirrored 1.5882
+            with contextlib.redirect_stderr(io.StringIO()):
+                wbc_driver._handle_joint(ctx, joint_msg(rows))
+            wp = ctx.backend.goals[0]["target_upper_body_pose"][0]
+            lim = ctx.arm_limits
+            self.assertAlmostEqual(wp[1], lim.upper[1] - lim.MARGIN, places=12, msg=mode)
+            self.assertAlmostEqual(wp[15], lim.upper[8] - lim.MARGIN, places=12, msg=mode)
+            self.assertAlmostEqual(lim.upper[1], 2.2515, places=4)
+            self.assertAlmostEqual(lim.upper[8], 1.5882, places=4)
+            self.assertEqual(ctx.stats.joints_clamped, 2, mode)
+
+    def test_elbow_between_urdf_and_ik_override(self):
+        s = solver().settings
+        for mode, expect in (("urdf", 1.6), ("ik", s.elbow_upper_limit_override - 1e-3)):
+            ctx = make_ctx(limits=mode, max_joint_vel=0)
+            rows = joint_rows(T=1)
+            rows[0, 7] = 1.6           # left elbow: inside the URDF (2.0944), over the IK override (1.4)
+            with contextlib.redirect_stderr(io.StringIO()):
+                wbc_driver._handle_joint(ctx, joint_msg(rows))
+            wp = ctx.backend.goals[0]["target_upper_body_pose"][0]
+            self.assertAlmostEqual(wp[3], expect, places=6, msg=mode)
+            self.assertEqual(ctx.stats.joints_clamped, 0 if mode == "urdf" else 1, mode)
 
     def test_out_of_range_joint_is_clamped_counted_and_logged_once(self):
         ctx = make_ctx(max_joint_vel=0)
@@ -381,16 +436,6 @@ class JointPositionClamp(unittest.TestCase):
         log = err.getvalue()
         self.assertEqual(log.count("left_elbow_joint commanded"), 1)
         self.assertEqual(log.count("right_elbow_joint commanded"), 1)
-
-    def test_wbc_model_narrowing_of_shoulder_roll_applies(self):
-        ctx = make_ctx(max_joint_vel=0)
-        rows = joint_rows(T=1)
-        rows[0, 5] = 0.0          # left shoulder_roll: URDF allows it, WBC model does not
-        with contextlib.redirect_stderr(io.StringIO()):
-            wbc_driver._handle_joint(ctx, joint_msg(rows))
-        wp = ctx.backend.goals[0]["target_upper_body_pose"][0]
-        self.assertAlmostEqual(wp[1], ctx.arm_limits.lower[1] + ctx.arm_limits.MARGIN, places=12)
-        self.assertGreater(ctx.arm_limits.lower[1], 0.0)
 
     def test_small_trims_are_applied_but_not_reported(self):
         ctx = make_ctx(max_joint_vel=0)
