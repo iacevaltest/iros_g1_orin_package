@@ -61,12 +61,26 @@ does with your output once you run it:
 | Lane | Your output | What happens to it |
 |---|---|---|
 | **`decoupled`** | one `(T,25)` task-space pose chunk per message | the adapter's IK solves it into joint targets, sent to NVIDIA's Decoupled WBC over ROS2 |
+| **`joint`** | one `(T,22)` chunk of hand commands + 7+7 arm joint angles per message (plus `goto` start-pose requests) | no IK: the angles are position- and rate-clamped and sent to the same Decoupled WBC as `decoupled`, through the same `wbc_driver.py --lane decoupled` run |
 | **`sonic`** | `motion_token (T,64)` + hand joints at 50Hz | relayed byte-for-byte (no translation) into `gear_sonic_deploy`, NVIDIA's C++/TensorRT deploy binary |
 
 If you're `decoupled`: the WBC runs **no IK of its own** in its control
 loop — it just interpolates between the joint targets it's handed. All the
 IK happens upstream, in `wbc_driver.py`, using your published
 end-effector pose.
+
+**Which lane for which policy.** A policy trained on wrist poses
+(end-effector position + quaternion actions) is `decoupled`. A policy
+trained on `action.robot_q_desired`-style joint actions — the arm joint
+angles themselves — is `joint`: publish the angles you predict, in the
+`body_q` order you observed them, and nothing re-solves them. Pushing
+joint-space actions through `decoupled` (FK on your side, IK on ours)
+is not faithful: a 7-DoF arm on a 6-DoF target, with the solver's posture
+task pulling toward its seed. Both lanes run through the same
+`wbc_driver.py --lane decoupled` process and the same WBC; `joint` is on by
+default there (`--joint-lane on`) and adds `--joint-lane-limits` and
+`--goto-max-speed` (§9). The `joint` lane's contract, clamps and the `goto`
+request are in `docs/CONTRACT.md`, "The `joint` lane".
 
 ## 3 · Pre-flight — things that are YOUR responsibility to get right
 
@@ -403,6 +417,9 @@ Generated from the source of each script. Run any of them with
 | `--dex1-port` | `5599` | where run_wbc_with_dex1.py listens for gripper targets. 0 disables (no grasp possible). |
 | `--dex1-host` | `'127.0.0.1'` |  |
 | `--max-chunk-age-s` | `1.0` | drop a chunk older than this (0 disables). Guards against acting on a stale plan after a stall. |
+| `--joint-lane` | `'on'` | accept the b'joint' (T,22) joint-angle chunks and b'goto' pose requests on the same :5556 socket, alongside b'taskspace'. The taskspace path is unaffected either way. 'off' ignores both topics like any unknown prefix. |
+| `--joint-lane-limits` | `'urdf'` | which position limits the joint lane clamps arm angles to (never typed in; read from the robot model). 'urdf' (default) = the limits exactly as the WBC's own robot model loads them -- the URDF plus the WBC's supplemental narrowing (shoulder_roll kept +-0.19 rad from the torso), i.e. the same table its JointSafetyMonitor enforces on the real robot. 'ik' additionally applies ik.py's solver-side overrides (elbow upper bound 1.4, wrist_roll +-0.9) so the joint lane ranges over the same space the taskspace lane's IK does; those exist to steer a redundant solution, not to protect hardware, so they are not the default. Switch if ruled. |
+| `--goto-max-speed` | `0.45` | rad/s ceiling on a b'goto' request's own max_speed. Also capped by --max-joint-vel so the step clamp never shortens the ramp. 0.45 is the speed the joint-space pre-motion that preceded this lane ran at live. |
 | `--sonic-host` | `'127.0.0.1'` |  |
 | `--sonic-port` | `5580` | gear_sonic_deploy's zmq input endpoint (--input-type zmq, NOT the default --input-type zmq_manager -- that one runs an internal planner nobody wants here). CONFIRMED 2026-09-04: g1_deploy_onnx_ref.cpp's own --zmq-port compiles in a default of 5556, same as the boundary's action port -- deploy.sh can't even pass --zmq-port through, so reaching this requires calling `just run g1_deploy_onnx_ref` directly with --zmq-port matching this flag. 5580 isn't special, just deliberately not 5555/5556/5557 (the organizer's camera/action/state ports) -- confirm whatever port gear_sonic_deploy is actually launched with matches this value exactly. |
 | `--sonic-socket` | `'pub'` |  |

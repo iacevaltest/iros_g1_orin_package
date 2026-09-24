@@ -33,6 +33,13 @@ per call, relayed byte-for-byte into the controller. No IK involved. Topic
 prefix `b"pose"`, 1280-byte zero-padded JSON header then raw
 little-endian buffers. `|token| ≤ 1.25`.
 
+**`joint`** — you emit arm **joint angles** (the 7+7 values a
+`robot_q_desired`-style policy predicts). One whole `(T,22)` chunk per
+message, `T ≤ 64`, topic prefix `b"joint"`, plus a `b"goto"` request to
+move the arms to a start pose. Same socket, same organizer adapter and same
+whole-body controller as `decoupled`; the only difference is that no IK is
+run — see [The `joint` lane](#the-joint-lane) below.
+
 ## The `(T,25)` row layout — fixed, do not reorder
 
 ```
@@ -62,6 +69,119 @@ quaternions unit-norm (1e-2 tolerance). A malformed action raises
 byte-identical URDF. If your policy assumes a tool offset, apply it in your
 own code before publishing — the organizer's value is global and will not be
 changed per team.
+
+## The `joint` lane
+
+Use it when your policy was trained on joint-space actions. Sending those
+through `decoupled` means running your joints through forward kinematics,
+publishing wrist poses, and having the organizer's IK regenerate joints —
+and that round trip is not faithful (a 7-DoF arm on a 6-DoF target; the
+solver's posture task pulls toward its seed). The controller's native
+input is already joint space, so `joint` hands your angles to it directly.
+
+Declare `joint` in `manifest.yaml`. The bench brings up the same controller
+stack as for `decoupled`; the declaration tells the organizer what your
+rows mean.
+
+### The `(T,22)` row layout — fixed, do not reorder
+
+```
+[0:2]    left hand, 2 finger joints,  -1 = open, +1 = closed   (as (T,25))
+[2:4]    right hand, same convention
+[4:11]   left arm, 7 joint angles, radians
+[11:18]  right arm, 7 joint angles, radians
+[18:21]  navigate_cmd (vx, vy, yaw_rate)                       (as (T,25))
+[21]     base_height_cmd                                        (as (T,25))
+```
+
+Arm order is Unitree's canonical `G1JointIndex` order — `shoulder_pitch,
+shoulder_roll, shoulder_yaw, elbow, wrist_roll, wrist_pitch, wrist_yaw` —
+which is exactly `body_q[15:22]` (left) and `body_q[22:29]` (right) on the
+state stream. Publish in the frame you observe. There is no torso column:
+the adapter never forwards one on either lane.
+
+Wire: `b"joint"` + msgpack `{"actions": <float32 bytes>, "shape": [T, 22],
+"dtype": "f32", "issued_at": <float, sender wall clock>}` — the same
+envelope as `taskspace`. `boundary/actions.py`'s `JointSink` builds it;
+`JointSink.make_rows(left_arm, right_arm, left_hand, right_hand, navigate,
+base_height)` assembles the rows and `JOINT_SLICES` names the columns.
+
+Validated before publish, and again by the adapter (a bad chunk is dropped
+and counted, like a bad `(T,25)` chunk): dtype floating (cast to float32),
+all finite, `1 ≤ T ≤ 64`, hand commands within `[-1, 1]` (1e-3
+tolerance). **Joint angles are not range-checked on the wire**; the adapter
+clamps them (next section) rather than dropping a chunk over a hair past a
+limit.
+
+### What the adapter does with a chunk
+
+In order, and nothing else:
+
+1. decode, validate; require fresh robot state (no state, no motion —
+   same refusal as `decoupled`); drop the chunk if `issued_at` is older
+   than `--max-chunk-age-s`;
+2. **position clamp** each arm joint to the robot model's limits (below);
+3. **step clamp**: the same `--max-joint-vel` / `--chunk-hz` rate limit
+   the IK output gets, anchored on the freshly measured arms for the first
+   row of every chunk — a row far from where the arm is becomes a bounded
+   step toward it;
+4. write the 14 angles into the controller's upper-body vector. That
+   vector is 28 wide on this rig (7+7 arm joints plus 7+7 three-finger
+   hand joints the controller's model carries); the hand slots are copied
+   from the measured state and the two-finger grippers ignore them. You
+   never see this vector;
+5. publish the chunk as one interpolated waypoint trajectory scheduled
+   from now at `--chunk-hz`, and relay row 0's hand commands to the
+   grippers — identical to the `decoupled` path from this point on.
+
+**No IK runs anywhere on this lane**, and nothing on it changes what the
+`decoupled` path does with a `(T,25)` chunk.
+
+### Limits and clamps
+
+| Clamp | Source | Setting |
+|---|---|---|
+| position | the controller's own robot model: the URDF limits plus the WBC's supplemental narrowing (`shoulder_roll` is kept 0.19 rad from the torso) — the same table its joint safety monitor enforces on the real robot. Read from the model, never typed in; a 1e-3 rad margin keeps commands off the exact edge. | `--joint-lane-limits urdf` (default) |
+| position, IK-parity | the above plus the two overrides the organizer's IK solver applies to itself (`elbow ≤ 1.4`, `wrist_roll` within `±0.9`). Those exist to steer a redundant IK solution, not to protect hardware, so they are **not** applied to joint-space policies unless ruled. | `--joint-lane-limits ik` |
+| step | `--max-joint-vel` (1.0 rad/s) at `--chunk-hz` (20 Hz): 0.05 rad per row | as `decoupled` |
+
+Every clamped value is counted in the adapter's `[stats]` line; the first
+clamp of each joint is also logged with the value and the limit. A policy
+that is clamped often is a policy commanding outside the robot's range —
+that is visible in your own published rows, and it is yours.
+
+### `goto` — move to a start pose
+
+Wire: `b"goto"` + msgpack `{"left_arm": [7 floats], "right_arm": [7 floats],
+"max_speed": <rad/s>, "hands": [left, right] (optional), "issued_at":
+<float>}`. `JointSink.send_goto(left_arm, right_arm, max_speed=0.3,
+hands=None)` sends it.
+
+The adapter reads the measured arms, position-clamps the target, builds a
+straight-line joint interpolation from measured to target at
+`min(max_speed, --goto-max-speed [0.45], --max-joint-vel)` sampled at
+`--chunk-hz`, and publishes it as **one** multi-waypoint goal through the
+same step clamp → mapper → publish path. The final waypoint is exactly the
+(clamped) target. `hands`, if given, is relayed to the grippers once;
+omitted, the grippers stay as they are. The base keeps the last commanded
+`navigate_cmd` / `base_height_cmd` (the controller's defaults if nothing was
+commanded yet). A stale `goto` is dropped like a stale chunk.
+
+It **does not block**. The adapter keeps the trajectory alive (its
+keepalive re-sends the part still ahead, then holds the final pose); you
+decide arrival by watching `body_q` on `:5557` —
+`boundary.actions.arms_reached(body_q, left_arm, right_arm, tol_rad=0.05)`
+is the check. Do not publish chunks while a `goto` is under way: `:5556` is
+newest-wins, so a later chunk supersedes it, and a chunk sent in the same
+instant may cause the `goto` to be dropped. That precedence is deliberate —
+your policy's chunk always wins over a positioning request.
+
+### Ownership
+
+The whole-body controller owns `rt/lowcmd`; nothing on this lane talks to
+the motors. The `joint` lane is the **only** joint-space channel into the
+controller, and it enters through the same adapter, clamps and keepalive as
+every other lane. The independent e-stop overrides everything on it.
 
 ## State — `:5557`
 
@@ -117,6 +237,9 @@ change an outcome. They will not change mid-series.
 | `--max-chunk-age-s` | `1.0` | When a plan is too stale to act on |
 | `--max-waypoints` | `16` | How much of each chunk executes |
 | `--chunk-hz` | `20.0` | Scheduling rate |
+| `--joint-lane` | `on` | Whether `b"joint"` / `b"goto"` are accepted at all |
+| `--joint-lane-limits` | `urdf` | Which position limits the `joint` lane clamps to (see [Limits and clamps](#limits-and-clamps)) |
+| `--goto-max-speed` | `0.45` | Ceiling on a `goto` request's speed, rad/s |
 
 `--ik-warm-start current` is not a tuning preference. Warm-starting from the
 *previous solution* made results depend on message arrival order — the same 8
