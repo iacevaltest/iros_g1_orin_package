@@ -468,11 +468,16 @@ def arms_reached(
     body_q29: np.ndarray,
     left_arm: np.ndarray,
     right_arm: np.ndarray,
-    tol_rad: float = 0.05,
+    tol_rad: float = 0.10,
 ) -> bool:
     """True when every arm joint in ``body_q`` (the (29,) state vector from
     :5557) is within ``tol_rad`` of the target. Pure; pair it with
-    ``StateStream`` to wait for a ``send_goto`` to land."""
+    ``StateStream`` to wait for a ``send_goto`` to land.
+
+    The controller's PD tracking (no gravity compensation) settles loaded
+    joints 0.05-0.07 rad from the command, so a tolerance below ~0.08 may
+    never fire on a raised arm; 0.10 is the default for that reason.
+    Compare trends if you need something tighter."""
     q = np.asarray(body_q29, dtype=np.float64).reshape(-1)
     if q.shape[0] != BODY_DOF:
         raise ActionError(f"body_q has {q.shape[0]} entries, expected {BODY_DOF}")

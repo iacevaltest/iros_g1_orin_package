@@ -88,6 +88,12 @@ GOTO_MAX_DURATION_S = 15.0
 # The WBC holds its last scheduled waypoint, so only the near future needs
 # refreshing; the whole remaining trajectory does not.
 KEEPALIVE_WINDOW_S = 2.0
+# A position clamp smaller than this is applied but neither counted nor
+# logged. The WBC's own model narrows shoulder_roll to +-0.19 rad while the
+# rest pose measures 0.1875, so echoing the measured pose is "clamped" by
+# 2.5 mrad on every row; the counter is meant to report out-of-range
+# INTENT, not sub-centiradian trims.
+CLAMP_REPORT_THRESHOLD_RAD = 1e-2
 
 
 class Stats:
@@ -515,14 +521,17 @@ def _step_clamp(ctx: _DecoupledContext, arms, i: int, fresh_body_q, max_step):
 def _position_clamp(ctx: _DecoupledContext, arms):
     """Joint lane only: pull each arm joint inside the robot model's limits.
 
-    Logs once per joint the first time it happens; every clamped value is
-    counted in stats.joints_clamped. The taskspace lane never comes here
-    -- its IK is bounded by the solver's own limits.
+    Logs once per joint the first time it happens; every clamp larger than
+    CLAMP_REPORT_THRESHOLD_RAD is counted in stats.joints_clamped (smaller
+    trims are applied silently). The taskspace lane never comes here --
+    its IK is bounded by the solver's own limits.
     """
     lim = ctx.arm_limits
     if lim is None:
         return np.asarray(arms, dtype=np.float64)
-    clamped, hit = lim.clamp(arms)
+    clamped, _ = lim.clamp(arms)
+    # every clamp is applied; only a material one is reported
+    hit = np.abs(clamped - np.asarray(arms, dtype=np.float64)) > CLAMP_REPORT_THRESHOLD_RAD
     if hit.any():
         ctx.stats.joints_clamped += int(hit.sum())
         for j in np.flatnonzero(hit):

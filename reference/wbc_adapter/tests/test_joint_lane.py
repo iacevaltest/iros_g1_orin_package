@@ -392,6 +392,32 @@ class JointPositionClamp(unittest.TestCase):
         self.assertAlmostEqual(wp[1], ctx.arm_limits.lower[1] + ctx.arm_limits.MARGIN, places=12)
         self.assertGreater(ctx.arm_limits.lower[1], 0.0)
 
+    def test_small_trims_are_applied_but_not_reported(self):
+        ctx = make_ctx(max_joint_vel=0)
+        lim = ctx.arm_limits
+        lo = lim.lower[1] + lim.MARGIN                 # left shoulder_roll floor, 0.191
+        rows = joint_rows(T=3)
+        rows[:, 5] = lo - 0.0025                       # the rest pose: 2.5 mrad under
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            wbc_driver._handle_joint(ctx, joint_msg(rows))
+        for wp in ctx.backend.goals[0]["target_upper_body_pose"]:
+            self.assertAlmostEqual(wp[1], lo, places=12)   # clamped exactly as before
+        self.assertEqual(ctx.stats.joints_clamped, 0)      # but not counted
+        self.assertEqual(err.getvalue(), "")               # nor logged
+        # a 0.1 rad trim on the same joint is intent: counted, logged once
+        rows[:, 5] = lo - 0.1
+        with contextlib.redirect_stderr(err):
+            wbc_driver._handle_joint(ctx, joint_msg(rows))
+            wbc_driver._handle_joint(ctx, joint_msg(rows))
+        for goal in ctx.backend.goals[1:]:
+            for wp in goal["target_upper_body_pose"]:
+                self.assertAlmostEqual(wp[1], lo, places=12)
+        self.assertEqual(ctx.stats.joints_clamped, 6)
+        self.assertEqual(err.getvalue().count("left_shoulder_roll_joint commanded"), 1)
+        self.assertGreater(0.0025, 0.0)
+        self.assertLess(0.0025, wbc_driver.CLAMP_REPORT_THRESHOLD_RAD)
+
     def test_ik_mode_applies_the_solver_overrides(self):
         s = solver().settings
         urdf = wbc_driver._load_arm_limits("urdf", mapper(), s)
@@ -1055,7 +1081,9 @@ class ClientLibrary(unittest.TestCase):
         self.assertTrue(arms_reached(q29, LEFT_ARM, RIGHT_ARM))
         self.assertTrue(arms_reached(q29, LEFT_ARM + 0.04, RIGHT_ARM - 0.04, tol_rad=0.05))
         self.assertFalse(arms_reached(q29, LEFT_ARM + 0.06, RIGHT_ARM, tol_rad=0.05))
-        self.assertFalse(arms_reached(q29, LEFT_ARM, RIGHT_ARM + np.eye(7)[6] * 0.1))
+        # default tolerance 0.10: a PD steady-state offset of 0.066 counts as reached
+        self.assertTrue(arms_reached(q29, LEFT_ARM + 0.066, RIGHT_ARM - 0.066))
+        self.assertFalse(arms_reached(q29, LEFT_ARM, RIGHT_ARM + np.eye(7)[6] * 0.11))
         with self.assertRaises(ActionError):
             arms_reached(Q43, LEFT_ARM, RIGHT_ARM)     # 43-wide is the WBC's q, not body_q
         with self.assertRaises(ActionError):

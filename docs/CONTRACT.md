@@ -151,10 +151,21 @@ waypoint is due, it holds that final pose. Same on both lanes.
 | position, IK-parity | the above plus the two overrides the organizer's IK solver applies to itself (`elbow ≤ 1.4`, `wrist_roll` within `±0.9`). Those exist to steer a redundant IK solution, not to protect hardware, so they are **not** applied to joint-space policies unless ruled. | `--joint-lane-limits ik` |
 | step | `--max-joint-vel` (1.0 rad/s) at `--chunk-hz` (20 Hz): 0.05 rad per row | as `decoupled` |
 
-Every clamped value is counted in the adapter's `[stats]` line; the first
-clamp of each joint is also logged with the value and the limit. A policy
-that is clamped often is a policy commanding outside the robot's range —
-that is visible in your own published rows, and it is yours.
+Every clamp larger than 0.01 rad is counted in the adapter's `[stats]`
+line, and the first such clamp of each joint is logged with the value and
+the limit; smaller trims are applied silently (the controller's own model
+narrows `shoulder_roll` to 0.19 rad while the rest pose measures 0.1875, so
+echoing the measured pose would otherwise count as a clamp on every row).
+The counter reports out-of-range **intent**, not sub-centiradian trims. A
+policy that is clamped often is a policy commanding outside the robot's
+range — that is visible in your own published rows, and it is yours.
+
+**First goal after connecting.** The controller holds its own start-up
+pose (`shoulder_roll` ±0.2 rad, everything else 0) rather than the measured
+pose, so the first trajectory it receives may step up to ~0.1 rad in one
+tick regardless of what you publish. A `goto` first, or the step clamp on
+your first chunk, bounds that step. (Controller start-up pose; tracked
+separately from this contract.)
 
 ### `goto` — move to a start pose
 
@@ -180,8 +191,11 @@ nothing was commanded yet). A stale `goto` is dropped like a stale chunk.
 It **does not block**. The adapter keeps the trajectory alive (its
 keepalive re-sends the waypoints due within the next 2 s, then holds the
 final pose); you decide arrival by watching `body_q` on `:5557` —
-`boundary.actions.arms_reached(body_q, left_arm, right_arm, tol_rad=0.05)`
-is the check. Do not publish chunks while a `goto` is under way: `:5556` is
+`boundary.actions.arms_reached(body_q, left_arm, right_arm, tol_rad=0.10)`
+is the check. **Measured joints settle 0.05–0.07 rad from the command
+under load** (PD tracking without gravity compensation), so use a tolerance
+of at least 0.08 rad or compare trends; `0.10` is the default because
+`0.05` never fires on a raised arm. Do not publish chunks while a `goto` is under way: `:5556` is
 newest-wins, so a later chunk supersedes it, and a chunk sent in the same
 instant may cause the `goto` to be dropped. That precedence is deliberate —
 your policy's chunk always wins over a positioning request.
