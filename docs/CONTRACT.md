@@ -135,6 +135,11 @@ In order, and nothing else:
    from now at `--chunk-hz`, and relay row 0's hand commands to the
    grippers — identical to the `decoupled` path from this point on.
 
+While your client is silent the adapter's keepalive (every 200 ms) re-sends
+the not-yet-due waypoints of the last chunk with their original times (up
+to 2 s ahead), so a chunk plays out at the pace you scheduled; once its last
+waypoint is due, it holds that final pose. Same on both lanes.
+
 **No IK runs anywhere on this lane**, and nothing on it changes what the
 `decoupled` path does with a `(T,25)` chunk.
 

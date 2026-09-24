@@ -84,10 +84,10 @@ LANES = ("decoupled", "sonic")
 # into a trajectory of tens of thousands of waypoints (the WBC schedules
 # each one, and the keepalive would re-send them).
 GOTO_MAX_DURATION_S = 15.0
-# How far ahead a goto keepalive re-sends waypoints. The WBC holds its last
-# scheduled waypoint, so only the near future needs refreshing; the whole
-# remaining trajectory is not.
-GOTO_KEEPALIVE_WINDOW_S = 2.0
+# How far ahead a keepalive re-sends the in-flight trajectory's waypoints.
+# The WBC holds its last scheduled waypoint, so only the near future needs
+# refreshing; the whole remaining trajectory does not.
+KEEPALIVE_WINDOW_S = 2.0
 
 
 class Stats:
@@ -345,15 +345,18 @@ class _DecoupledContext:
         # enough to hit the existing keepalive path.
         self.last_publish_time = time.monotonic()
         self.last_report = time.monotonic()
-        # A goto trajectory still ahead of the WBC's clock, if any. A goto is
-        # one goal spanning seconds, while the keepalive fires after 200ms of
-        # client silence; the WBC's InterpolationPolicy.schedule_waypoint
-        # TRIMS everything after the garbage-collection time when a waypoint
-        # arrives earlier than its last scheduled one, so a single-row hold
-        # at t+1/chunk_hz would cut the goto short and demand its final pose
-        # almost at once. While this is set the keepalive re-sends the
-        # remaining future waypoints instead (see _publish_keepalive).
-        self.goto_in_flight: dict | None = None
+        # The last published trajectory, every lane: waypoints with their
+        # ORIGINAL target times and per-waypoint base commands. The keepalive
+        # fires after 200ms of client silence, and the WBC's
+        # InterpolationPolicy.schedule_waypoint TRIMS everything after the
+        # garbage-collection time when a waypoint arrives earlier than its
+        # last scheduled one -- so a single-row hold at t+1/chunk_hz cut
+        # every chunk short: 0.2s at pace, then a lunge to its last waypoint
+        # within 50ms (measured 2.5-3.0 rad/s against --max-joint-vel 1.0 in
+        # sim, on both lanes). While waypoints of this trajectory are still
+        # ahead of the clock the keepalive re-sends those instead, with their
+        # original times; the plain hold is only for after the last one.
+        self.in_flight: dict | None = None
         # Joints already reported as clamped -- the log line fires once per
         # joint; stats.joints_clamped carries the running count.
         self.clamp_logged: set[int] = set()
@@ -374,27 +377,32 @@ def _publish_keepalive(ctx: _DecoupledContext) -> bool:
     args, backend = ctx.args, ctx.backend
     if not (args.live and backend is not None and ctx.last_goal_template is not None):
         return False
-    g = ctx.goto_in_flight
+    tpl = ctx.last_goal_template
+    g = ctx.in_flight
     if g is not None:
         now = time.monotonic()
-        # Only the near future: contiguous dt-spaced waypoints mean the
-        # first future one is at most dt away, so an empty window means
-        # the trajectory is over, never that it is merely far ahead.
+        # The part of the trajectory still ahead of the clock, within a
+        # bounded window, with its ORIGINAL times -- re-scheduling the same
+        # (time, pose) pairs rebuilds the same trajectory in the WBC. Only
+        # strictly-future times: a waypoint at or before now would be
+        # trimmed away, or worse, become an instant target. Contiguous
+        # dt-spaced waypoints mean the first future one is at most dt away,
+        # so an empty window means the trajectory is over.
         ahead = [i for i, t in enumerate(g["times"])
-                 if now < t <= now + GOTO_KEEPALIVE_WINDOW_S]
+                 if now < t <= now + KEEPALIVE_WINDOW_S]
         if ahead:
             keep_goal = wbc_goal.build_goal(
                 upper_body_waypoints=np.asarray([g["upper_body"][i] for i in ahead]),
                 target_time=[g["times"][i] for i in ahead],
-                base_height_command=[g["base_height"]] * len(ahead),
-                navigate_cmd=[g["navigate_cmd"]] * len(ahead),
+                base_height_command=[g["base_heights"][i] for i in ahead],
+                navigate_cmd=[g["nav_cmds"][i] for i in ahead],
+                wrist_pose=tpl["wrist_pose"],
             )
             backend.publish_goal(keep_goal)
             ctx.keepalives_sent += 1
             ctx.last_publish_time = time.monotonic()
             return True
-        ctx.goto_in_flight = None   # arrived; fall through to the plain hold
-    tpl = ctx.last_goal_template
+        ctx.in_flight = None   # played out; fall through to the plain hold
     keep_goal = wbc_goal.build_goal(
         upper_body_waypoints=tpl["upper_body"],
         target_time=[time.monotonic() + 1.0 / args.chunk_hz],
@@ -580,8 +588,12 @@ def _publish_trajectory(ctx: _DecoupledContext, waypoints, base_heights, nav_cmd
             "navigate_cmd": nav_cmds[-1],
             "wrist_pose": wrist_pose,
         }
-        # Whatever was in flight before is superseded by this goal.
-        ctx.goto_in_flight = None
+        # ...and the whole trajectory, for the keepalive to re-send the
+        # not-yet-due part of. Supersedes whatever was in flight before.
+        ctx.in_flight = {
+            "upper_body": list(waypoints), "times": list(times),
+            "base_heights": list(base_heights), "nav_cmds": list(nav_cmds),
+        }
 
     # boundary/actions.py: cols [0:2] left hand, [2:4] right hand,
     # -1 open .. +1 closed, both columns of a pair duplicated.
@@ -897,13 +909,7 @@ def _apply_goto(ctx: _DecoupledContext, req):
     n = len(waypoints)
     stats.goto_accepted += 1
     hands = None if req.hands is None else (req.hands[0], req.hands[1])
-    _, times = _publish_trajectory(ctx, waypoints, [base_height] * n, [navigate] * n,
-                                   None, hands)
-    if ctx.backend is not None:
-        ctx.goto_in_flight = {
-            "upper_body": waypoints, "times": times,
-            "base_height": base_height, "navigate_cmd": navigate,
-        }
+    _publish_trajectory(ctx, waypoints, [base_height] * n, [navigate] * n, None, hands)
     print(f"[adapter] goto: {n} waypoints over {n * dt:.2f}s at {speed:.2f} rad/s "
           f"(max |delta| {delta:.3f} rad, request {req.max_speed:.2f} rad/s, "
           f"age {age * 1000:.0f}ms)")

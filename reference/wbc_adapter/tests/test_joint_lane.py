@@ -211,9 +211,18 @@ class FakeSub:
         if not self.script:
             raise _StopLoop()
         item = self.script.pop(0)
+        item = item() if callable(item) else item
         if item == "again":
             raise zmq.Again()
-        return item() if callable(item) else item
+        return item
+
+
+def _again_after(seconds: float):
+    """Script item: wait, then time out -- a keepalive fired that much later."""
+    def _item():
+        time.sleep(seconds)
+        return "again"
+    return _item
 
 
 @contextlib.contextmanager
@@ -515,7 +524,7 @@ class Goto(unittest.TestCase):
         # template: the keepalive will hold the final pose
         np.testing.assert_allclose(ctx.last_goal_template["upper_body"],
                                    goal["target_upper_body_pose"][-1])
-        self.assertIsNotNone(ctx.goto_in_flight)
+        self.assertIsNotNone(ctx.in_flight)
         self.assertEqual(dex1.sent, [{"left": -1.0, "right": 1.0}])
         self.assertEqual(ctx.stats.goto_accepted, 1)
         self.assertEqual(ctx.stats.published, 1)
@@ -602,7 +611,7 @@ class Goto(unittest.TestCase):
         ka = ctx.backend.goals[1]
         k = len(ka["target_time"])
         self.assertGreaterEqual(k, 1)
-        self.assertLessEqual(k, int(wbc_driver.GOTO_KEEPALIVE_WINDOW_S * CHUNK_HZ) + 1)
+        self.assertLessEqual(k, int(wbc_driver.KEEPALIVE_WINDOW_S * CHUNK_HZ) + 1)
         np.testing.assert_allclose(np.asarray(ka["target_time"]),
                                    np.asarray(goto_goal["target_time"][:k]))
         np.testing.assert_allclose(np.asarray(ka["target_upper_body_pose"]),
@@ -610,18 +619,18 @@ class Goto(unittest.TestCase):
         self.assertEqual(ctx.keepalives_sent, 1)
         # half way through: only the future half is re-sent
         now = time.monotonic()
-        ctx.goto_in_flight["times"] = [now - 1.0 + i * DT for i in range(60)]
+        ctx.in_flight["times"] = [now - 1.0 + i * DT for i in range(60)]
         wbc_driver._publish_keepalive(ctx)
         ka2 = ctx.backend.goals[2]
-        self.assertTrue(all(now < t <= now + wbc_driver.GOTO_KEEPALIVE_WINDOW_S + 1e-6
+        self.assertTrue(all(now < t <= now + wbc_driver.KEEPALIVE_WINDOW_S + 1e-6
                             for t in ka2["target_time"]))
         self.assertLess(len(ka2["target_time"]), 60)
         self.assertGreater(len(ka2["target_time"]), 0)
         # trajectory done: plain single-row hold of the final pose
-        ctx.goto_in_flight["times"] = [now - 10.0 + i * DT for i in range(60)]
+        ctx.in_flight["times"] = [now - 10.0 + i * DT for i in range(60)]
         wbc_driver._publish_keepalive(ctx)
         ka3 = ctx.backend.goals[3]
-        self.assertIsNone(ctx.goto_in_flight)
+        self.assertIsNone(ctx.in_flight)
         # the pre-existing hold form: a one-waypoint trajectory at t+1/chunk_hz
         self.assertEqual(len(ka3["target_time"]), 1)
         self.assertGreater(ka3["target_time"][0], now)
@@ -630,9 +639,9 @@ class Goto(unittest.TestCase):
         # a later chunk supersedes whatever goto was in flight
         with contextlib.redirect_stdout(io.StringIO()):
             wbc_driver._handle_goto(ctx, goto_msg(self.TARGET_LEFT, self.TARGET_RIGHT, max_speed=0.3))
-        self.assertIsNotNone(ctx.goto_in_flight)
+        self.assertEqual(len(ctx.in_flight["times"]), 60)
         wbc_driver._handle_joint(ctx, joint_msg(joint_rows(T=2)))
-        self.assertIsNone(ctx.goto_in_flight)
+        self.assertEqual(len(ctx.in_flight["times"]), 2)     # the chunk's own trajectory now
 
 
 # ---------------------------------------------------------------------------
@@ -747,20 +756,52 @@ class TaskspaceRegression(unittest.TestCase):
         cls.chunk_b[:, 0:4] = [0.9, 0.9, -0.2, -0.2]
 
     def _script(self):
+        # chunk, immediate keepalive, chunk, immediate keepalive, then a
+        # keepalive after the last chunk (3 rows = 0.15 s) has played out
         return [lambda: taskspace_msg(self.chunk_a), "again",
-                lambda: taskspace_msg(self.chunk_b), "again"]
+                lambda: taskspace_msg(self.chunk_b), "again", _again_after(0.3)]
+
+    def _check_keepalives(self, new_goals, old_goals, label):
+        """Chunk goals identical old vs new; keepalives differ by design:
+        old = one-row hold, new = the chunk's future tail with original
+        times, then the hold once the tail is exhausted."""
+        self.assertEqual(len(new_goals), 5, label)
+        self.assertEqual(len(old_goals), 5, label)
+        _assert_goals_equal(self, [new_goals[0], new_goals[2]],
+                            [old_goals[0], old_goals[2]], label + " chunks")
+        for k in (1, 3):
+            self.assertEqual(len(old_goals[k]["target_time"]), 1, label)   # old: hold
+            chunk, ka = new_goals[k - 1], new_goals[k]
+            n = len(ka["target_time"])
+            self.assertGreaterEqual(n, 1, label)
+            self.assertLessEqual(n, len(chunk["target_time"]), label)
+            # the tail: last n waypoints of the chunk, ORIGINAL times
+            np.testing.assert_allclose(ka["target_time"], chunk["target_time"][-n:])
+            np.testing.assert_allclose(np.asarray(ka["target_upper_body_pose"]),
+                                       np.asarray(chunk["target_upper_body_pose"][-n:]))
+            np.testing.assert_allclose(np.asarray(ka["base_height_command"]),
+                                       np.asarray(chunk["base_height_command"][-n:]))
+            np.testing.assert_allclose(np.asarray(ka["navigate_cmd"]),
+                                       np.asarray(chunk["navigate_cmd"][-n:]))
+        # after chunk_b has played out: the hold form, final pose, fresh time
+        hold, old_hold = new_goals[4], old_goals[4]
+        self.assertEqual(len(hold["target_time"]), 1, label)
+        self.assertGreater(hold["target_time"][0], new_goals[2]["target_time"][-1])
+        for key in ("target_upper_body_pose", "base_height_command", "navigate_cmd", "wrist_pose"):
+            np.testing.assert_allclose(np.asarray(hold[key]), np.asarray(old_hold[key]),
+                                       atol=1e-9, err_msg=f"{label}: hold {key}")
 
     def test_goals_identical_to_baseline(self):
         args = make_args()
         new_backend, new_stats = drive(wbc_driver, args, self._script())
         old_backend, old_stats = drive(self.baseline, args, self._script())
-        # 2 chunks + 2 keepalives each; IK really ran and accepted
-        self.assertEqual(len(old_backend.goals), 4)
+        # 2 chunks + 3 keepalives each; IK really ran and accepted
+        self.assertEqual(len(old_backend.goals), 5)
         self.assertEqual(old_stats.waypoints, 7)
         self.assertGreater(old_stats.left_ok + old_stats.right_ok, 0)
         self.assertEqual(len(old_backend.goals[0]["target_upper_body_pose"]), 4)
         self.assertIn("wrist_pose", old_backend.goals[0])
-        _assert_goals_equal(self, new_backend.goals, old_backend.goals, "taskspace")
+        self._check_keepalives(new_backend.goals, old_backend.goals, "taskspace")
         for field in ("messages", "rejected", "stale", "waypoints", "left_ok",
                       "right_ok", "published", "gripper_sent"):
             self.assertEqual(getattr(new_stats, field), getattr(old_stats, field), field)
@@ -771,8 +812,7 @@ class TaskspaceRegression(unittest.TestCase):
             args = make_args(**over)
             new_backend, _ = drive(wbc_driver, args, self._script())
             old_backend, _ = drive(self.baseline, args, self._script())
-            self.assertEqual(len(old_backend.goals), 4)
-            _assert_goals_equal(self, new_backend.goals, old_backend.goals, f"taskspace {over}")
+            self._check_keepalives(new_backend.goals, old_backend.goals, f"taskspace {over}")
 
     def test_rejections_identical_to_baseline(self):
         bad = taskspace_rows(T=2)
@@ -809,6 +849,91 @@ class TaskspaceRegression(unittest.TestCase):
         self.assertEqual(on_stats.goto_accepted, 1)
         # the taskspace goal is the same whether or not joint traffic preceded it
         _assert_goals_equal(self, [on_backend.goals[2]], old_backend.goals, "lane on")
+
+
+class ChunkKeepalive(unittest.TestCase):
+    """The keepalive re-sends a chunk's not-yet-due waypoints with their
+    original times; only after the last one is due does it hold."""
+
+    def _run(self, ctx, send):
+        send()
+        chunk = ctx.backend.goals[-1]
+        times = list(chunk["target_time"])
+        T = len(times)
+        # immediately: everything is still ahead -> the whole chunk, same times
+        now = time.monotonic()
+        self.assertTrue(wbc_driver._publish_keepalive(ctx))
+        ka = ctx.backend.goals[-1]
+        self.assertEqual(len(ka["target_time"]), T)
+        np.testing.assert_allclose(ka["target_time"], times)
+        np.testing.assert_allclose(np.asarray(ka["target_upper_body_pose"]),
+                                   np.asarray(chunk["target_upper_body_pose"]))
+        self.assertTrue(all(t > now for t in ka["target_time"]))
+        # mid-chunk: rows 0 and 1 are past, row 2 is due exactly now (not
+        # future), so only rows 3.. come back, with their original times
+        now = time.monotonic()
+        ctx.in_flight["times"] = [now - 2 * DT + i * DT for i in range(T)]
+        wbc_driver._publish_keepalive(ctx)
+        ka = ctx.backend.goals[-1]
+        self.assertEqual(len(ka["target_time"]), T - 3)
+        np.testing.assert_allclose(ka["target_time"], ctx.in_flight["times"][3:])
+        np.testing.assert_allclose(np.asarray(ka["target_upper_body_pose"]),
+                                   np.asarray(chunk["target_upper_body_pose"][3:]))
+        np.testing.assert_allclose(np.asarray(ka["base_height_command"]),
+                                   np.asarray(chunk["base_height_command"][3:]))
+        np.testing.assert_allclose(np.asarray(ka["navigate_cmd"]),
+                                   np.asarray(chunk["navigate_cmd"][3:]))
+        self.assertTrue(all(t > now for t in ka["target_time"]))
+        # exactly-now is not future
+        ctx.in_flight["times"] = [time.monotonic() - 1.0] * (T - 1) + [time.monotonic()]
+        n_before = len(ctx.backend.goals)
+        wbc_driver._publish_keepalive(ctx)
+        self.assertIsNone(ctx.in_flight)
+        hold = ctx.backend.goals[-1]
+        self.assertEqual(len(ctx.backend.goals), n_before + 1)
+        # after the last time: the hold form -- one row, final pose, now + dt
+        self.assertEqual(len(hold["target_time"]), 1)
+        self.assertGreater(hold["target_time"][0], time.monotonic())
+        np.testing.assert_allclose(hold["target_upper_body_pose"][0],
+                                   chunk["target_upper_body_pose"][-1])
+        np.testing.assert_allclose(hold["base_height_command"][0], chunk["base_height_command"][-1])
+        np.testing.assert_allclose(hold["navigate_cmd"][0], chunk["navigate_cmd"][-1])
+        # stays the hold from now on
+        wbc_driver._publish_keepalive(ctx)
+        self.assertEqual(len(ctx.backend.goals[-1]["target_time"]), 1)
+        for g in ctx.backend.goals[1:]:
+            self.assertNotIn("goto", g)
+        return chunk
+
+    def test_joint_chunk(self):
+        ctx = make_ctx()
+        chunk = self._run(ctx, lambda: wbc_driver._handle_joint(ctx, joint_msg(joint_rows(T=6))))
+        self.assertEqual(len(chunk["target_time"]), 6)
+        self.assertNotIn("wrist_pose", ctx.backend.goals[1])
+
+    def test_taskspace_chunk(self):
+        ctx = make_ctx()
+        chunk = self._run(ctx, lambda: wbc_driver._handle_taskspace(
+            ctx, taskspace_msg(taskspace_rows(T=4))))
+        self.assertEqual(len(chunk["target_time"]), 4)
+        # the tail carries the chunk's wrist_pose, like the hold does
+        np.testing.assert_allclose(ctx.backend.goals[1]["wrist_pose"], chunk["wrist_pose"])
+
+    def test_never_publishes_a_waypoint_at_or_before_now(self):
+        ctx = make_ctx()
+        wbc_driver._handle_joint(ctx, joint_msg(joint_rows(T=8)))
+        base = ctx.in_flight["times"]
+        for shift in (0.0, 0.05, 0.12, 0.3, 0.39, 0.4, 1.0):
+            now = time.monotonic()
+            ctx.in_flight = {"upper_body": ctx.backend.goals[0]["target_upper_body_pose"],
+                             "times": [t - (base[0] - now) - shift for t in base],
+                             "base_heights": ctx.backend.goals[0]["base_height_command"],
+                             "nav_cmds": ctx.backend.goals[0]["navigate_cmd"]}
+            wbc_driver._publish_keepalive(ctx)
+            ka = ctx.backend.goals[-1]
+            self.assertTrue(all(t > now for t in ka["target_time"]), shift)
+            if ctx.in_flight is None:
+                self.assertEqual(len(ka["target_time"]), 1)
 
 
 class TaskspaceGripperRelay(unittest.TestCase):
@@ -1045,7 +1170,7 @@ class ReviewFixes(unittest.TestCase):
             self.assertTrue(all(t > now for t in ka["target_time"]))
             np.testing.assert_allclose(np.diff(ka["target_time"]), DT, atol=1e-9)
         # the plain hold (no goto in flight) is the pre-existing one-row form
-        ctx.goto_in_flight = None
+        ctx.in_flight = None
         wbc_driver._publish_keepalive(ctx)
         self.assertEqual(len(ctx.backend.goals[-1]["target_time"]), 1)
 
