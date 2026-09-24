@@ -79,6 +79,16 @@ import wbc_goal  # noqa: E402
 
 LANES = ("decoupled", "sonic")
 
+# Joint lane bounds. A goto is ONE goal, so its length must be bounded: a
+# request that would take longer than this is refused rather than turned
+# into a trajectory of tens of thousands of waypoints (the WBC schedules
+# each one, and the keepalive would re-send them).
+GOTO_MAX_DURATION_S = 15.0
+# How far ahead a goto keepalive re-sends waypoints. The WBC holds its last
+# scheduled waypoint, so only the near future needs refreshing; the whole
+# remaining trajectory is not.
+GOTO_KEEPALIVE_WINDOW_S = 2.0
+
 
 class Stats:
     def __init__(self):
@@ -288,6 +298,12 @@ class _DecoupledContext:
         self.mapper = mapper
         self.dex1_pub = dex1_pub
         self.arm_limits = arm_limits
+        # --joint-lane on/off, and, when on, why it is unusable this run
+        # (limits could not be loaded): joint/goto messages are then
+        # REJECTED and counted rather than silently ignored.
+        self.joint_lane = getattr(args, "joint_lane", "on") == "on"
+        self.joint_lane_error: str | None = None
+        self.joint_lane_error_logged = False
         # Rate-limits the commanded arm joints against the last waypoint this
         # adapter actually scheduled. IK has no notion of how far away in TIME
         # its target is -- chunk_hz alone schedules the first waypoint of every
@@ -361,7 +377,11 @@ def _publish_keepalive(ctx: _DecoupledContext) -> bool:
     g = ctx.goto_in_flight
     if g is not None:
         now = time.monotonic()
-        ahead = [i for i, t in enumerate(g["times"]) if t > now]
+        # Only the near future: contiguous dt-spaced waypoints mean the
+        # first future one is at most dt away, so an empty window means
+        # the trajectory is over, never that it is merely far ahead.
+        ahead = [i for i, t in enumerate(g["times"])
+                 if now < t <= now + GOTO_KEEPALIVE_WINDOW_S]
         if ahead:
             keep_goal = wbc_goal.build_goal(
                 upper_body_waypoints=np.asarray([g["upper_body"][i] for i in ahead]),
@@ -729,6 +749,20 @@ def _handle_joint(ctx: _DecoupledContext, msg: bytes):
         print(f"[adapter] REJECTED joint chunk: {'; '.join(problems)}", file=sys.stderr)
         return
 
+    # Fail closed, like the IK path: an exception past this point drops
+    # the chunk (counted, logged), never the adapter. The WBC keeps its
+    # last goal and the keepalive keeps refreshing it.
+    try:
+        _apply_joint_chunk(ctx, chunk)
+    except Exception as exc:
+        stats.rejected += 1
+        stats.joint_rejected += 1
+        print(f"[adapter] joint chunk failed; holding last safe goal: "
+              f"{type(exc).__name__}: {exc}", file=sys.stderr)
+
+
+def _apply_joint_chunk(ctx: _DecoupledContext, chunk):
+    args, stats = ctx.args, ctx.stats
     body_q = _read_body_q(ctx)
     if body_q is None:
         return
@@ -749,6 +783,9 @@ def _handle_joint(ctx: _DecoupledContext, msg: bytes):
         arms = _step_clamp(ctx, arms, i, body_q, max_step)
         waypoints.append(_arm_waypoint(ctx, body_q, arms,
                                        _bench_upper_body(ctx, body_q, arms)))
+
+    if not waypoints:
+        return
 
     n = len(waypoints)
     stats.joint_accepted += 1
@@ -795,6 +832,29 @@ def _handle_goto(ctx: _DecoupledContext, msg: bytes):
         print(f"[adapter] REJECTED goto: {'; '.join(problems)}", file=sys.stderr)
         return
 
+    try:
+        _apply_goto(ctx, req)
+    except Exception as exc:
+        # Fail closed, like the IK path: the request is dropped, the
+        # adapter and the WBC's last goal both survive.
+        stats.rejected += 1
+        stats.goto_rejected += 1
+        print(f"[adapter] goto failed; holding last safe goal: "
+              f"{type(exc).__name__}: {exc}", file=sys.stderr)
+
+
+def _apply_goto(ctx: _DecoupledContext, req):
+    args, stats = ctx.args, ctx.stats
+    # A goto starts from the measured arms, so the measurement must be
+    # current, not merely present. (Chunks are anchored the same way but
+    # arrive continuously; a goto is a one-shot from a possibly idle
+    # state, so it is held to the backend's own staleness verdict.)
+    if ctx.backend is not None and ctx.backend.health().get("state_stale"):
+        stats.rejected += 1
+        stats.goto_rejected += 1
+        print("[adapter] robot state stale, goto refused", file=sys.stderr)
+        return
+
     body_q = _read_body_q(ctx)
     if body_q is None:
         return
@@ -812,6 +872,13 @@ def _handle_goto(ctx: _DecoupledContext, msg: bytes):
     max_step = args.max_joint_vel * dt if args.max_joint_vel else None
     delta = float(np.max(np.abs(target - measured)))
     steps = max(1, int(math.ceil(delta / (speed * dt) - 1e-9)))
+    if steps > args.chunk_hz * GOTO_MAX_DURATION_S:
+        stats.rejected += 1
+        stats.goto_rejected += 1
+        print(f"[adapter] REJECTED goto: {delta:.3f} rad at {speed:.3f} rad/s "
+              f"would take {steps * dt:.1f}s, over the {GOTO_MAX_DURATION_S:.0f}s "
+              f"cap -- ask for a faster move or a nearer pose", file=sys.stderr)
+        return
     path = np.linspace(measured, target, steps + 1)[1:]
 
     waypoints = []
@@ -820,12 +887,13 @@ def _handle_goto(ctx: _DecoupledContext, msg: bytes):
         waypoints.append(_arm_waypoint(ctx, body_q, arms,
                                        _bench_upper_body(ctx, body_q, arms)))
 
-    # A goto moves the arms and nothing else: the base keeps whatever was
-    # last commanded (or the WBC's own default when nothing was).
+    # A goto moves the arms and nothing else: the base stands still
+    # (navigate_cmd zero -- never inherit a walking command from the last
+    # chunk for the whole ramp) at the last commanded height, or the WBC's
+    # own default height when nothing was commanded yet.
     tpl = ctx.last_goal_template
     base_height = [wbc_goal.DEFAULT_BASE_HEIGHT] if tpl is None else list(tpl["base_height"])
-    navigate = (np.asarray(wbc_goal.DEFAULT_NAV_CMD, dtype=np.float64) if tpl is None
-                else np.asarray(tpl["navigate_cmd"], dtype=np.float64))
+    navigate = np.asarray(wbc_goal.DEFAULT_NAV_CMD, dtype=np.float64)
     n = len(waypoints)
     stats.goto_accepted += 1
     hands = None if req.hands is None else (req.hands[0], req.hands[1])
@@ -942,28 +1010,35 @@ def run_decoupled(args, sub: zmq.Socket, stats: Stats):
     # unknown prefix.
     joint_lane = args.joint_lane == "on"
     arm_limits = None
+    joint_lane_error = None
     if joint_lane:
         try:
             arm_limits = _load_arm_limits(args.joint_lane_limits, mapper, solver.settings)
         except Exception as exc:
-            if mapper is not None:
-                raise
-            # Bench mode with no robot model to read from: nothing reaches
-            # a robot here, so run unclamped rather than refuse to start.
-            print(f"[adapter] joint lane: no position limits available in bench "
-                  f"mode ({type(exc).__name__}: {exc}); position clamp OFF",
+            # Never refuse to launch over this: a taskspace-only run does
+            # not need the joint lane at all. Disable the lane for this
+            # run -- joint/goto messages are then rejected and counted,
+            # loudly, rather than driven unclamped.
+            joint_lane_error = f"{type(exc).__name__}: {exc}"
+            print("=" * 70, file=sys.stderr)
+            print(f"[adapter] WARNING: joint lane DISABLED for this run -- its "
+                  f"position limits could not be read from the robot model "
+                  f"({joint_lane_error}). b'joint'/b'goto' messages will be "
+                  f"REJECTED and counted. The taskspace lane is unaffected.",
                   file=sys.stderr)
-        print(f"[adapter] joint lane: ON -- topics {JOINT_TOPIC!r}/{GOTO_TOPIC!r}, "
-              f"limits={args.joint_lane_limits}, goto max speed "
-              f"{args.goto_max_speed:.2f} rad/s, position clamp "
-              f"{'ON' if arm_limits is not None else 'OFF'}")
+            print("=" * 70, file=sys.stderr)
         if arm_limits is not None:
+            print(f"[adapter] joint lane: ON -- topics {JOINT_TOPIC!r}/{GOTO_TOPIC!r}, "
+                  f"limits={args.joint_lane_limits}, goto max speed "
+                  f"{args.goto_max_speed:.2f} rad/s (cap {GOTO_MAX_DURATION_S:.0f}s "
+                  f"per move), position clamp ON")
             print(f"[adapter] joint lane limits ({arm_limits.describe()})")
     else:
         print(f"[adapter] joint lane: OFF -- {JOINT_TOPIC!r}/{GOTO_TOPIC!r} ignored")
 
     ctx = _DecoupledContext(args, stats, backend, state_sub, solver, mapper,
                             dex1_pub, arm_limits)
+    ctx.joint_lane_error = joint_lane_error
     while True:
         try:
             msg = sub.recv()
@@ -971,13 +1046,36 @@ def run_decoupled(args, sub: zmq.Socket, stats: Stats):
             if not _publish_keepalive(ctx):
                 print("[adapter] no actions on :5556 yet (is the team's Orin client up?)")
             continue
-        if msg.startswith(TASKSPACE_TOPIC):
-            _handle_taskspace(ctx, msg)
-        elif joint_lane and msg.startswith(JOINT_TOPIC):
-            _handle_joint(ctx, msg)
-        elif joint_lane and msg.startswith(GOTO_TOPIC):
-            _handle_goto(ctx, msg)
-        # anything else: not ours, ignored
+        _dispatch(ctx, msg)
+
+
+def _dispatch(ctx: _DecoupledContext, msg: bytes):
+    """Route one :5556 message by topic prefix. Anything else is ignored."""
+    if msg.startswith(TASKSPACE_TOPIC):
+        _handle_taskspace(ctx, msg)
+        return
+    is_joint = msg.startswith(JOINT_TOPIC)
+    is_goto = msg.startswith(GOTO_TOPIC)
+    if not (is_joint or is_goto):
+        return
+    if not ctx.joint_lane:
+        return      # --joint-lane off: ignored like any unknown prefix
+    if ctx.joint_lane_error is not None:
+        ctx.stats.rejected += 1
+        if is_joint:
+            ctx.stats.joint_rejected += 1
+        else:
+            ctx.stats.goto_rejected += 1
+        if not ctx.joint_lane_error_logged:
+            ctx.joint_lane_error_logged = True
+            print(f"[adapter] REJECTED {'joint chunk' if is_joint else 'goto'}: joint "
+                  f"lane disabled this run ({ctx.joint_lane_error}); further "
+                  f"rejections are counted, not logged", file=sys.stderr)
+        return
+    if is_joint:
+        _handle_joint(ctx, msg)
+    else:
+        _handle_goto(ctx, msg)
 
 
 _COMMAND_HEADER_SIZE = 1280  # must match ZMQPackedMessageSubscriber::HEADER_SIZE
@@ -1170,7 +1268,19 @@ def _refuse_incompatible_state_source(args):
     raise SystemExit(2)
 
 
-def main():
+def _positive_float(text: str) -> float:
+    try:
+        value = float(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"{text!r} is not a number")
+    if not (math.isfinite(value) and value > 0.0):
+        raise argparse.ArgumentTypeError(
+            f"must be > 0 rad/s, got {text!r} (0 does not mean 'disable' here; "
+            f"--joint-lane off is the switch)")
+    return value
+
+
+def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument("--lane", required=True, choices=LANES,
                    help="must match the team's manifest.yaml")
@@ -1304,8 +1414,9 @@ def main():
                         "same space the taskspace lane's IK does; those exist "
                         "to steer a redundant solution, not to protect hardware, "
                         "so they are not the default. Switch if ruled.")
-    p.add_argument("--goto-max-speed", type=float, default=0.45,
-                   help="rad/s ceiling on a b'goto' request's own max_speed. "
+    p.add_argument("--goto-max-speed", type=_positive_float, default=0.45,
+                   help="rad/s ceiling on a b'goto' request's own max_speed; "
+                        "must be > 0 (--joint-lane off is the switch, not 0). "
                         "Also capped by --max-joint-vel so the step clamp never "
                         "shortens the ramp. 0.45 is the speed the joint-space "
                         "pre-motion that preceded this lane ran at live.")
@@ -1326,7 +1437,11 @@ def main():
                         "gear_sonic_deploy is actually launched with matches "
                         "this value exactly.")
     p.add_argument("--sonic-socket", default="pub", choices=("pub", "push"))
-    args = p.parse_args()
+    return p
+
+
+def main():
+    args = build_parser().parse_args()
     _refuse_incompatible_state_source(args)
 
     print(f"[adapter] lane={args.lane} "

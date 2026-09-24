@@ -102,6 +102,7 @@ JOINT_TOPIC = b"joint"
 GOTO_TOPIC = b"goto"
 ARM_DOF = 7
 BODY_DOF = 29
+GOTO_MIN_SPEED = 0.01   # rad/s; the adapter refuses slower goto requests
 
 # (T, 22) row layout — fixed, do not reorder. Arm angles are radians in
 # Unitree's canonical G1JointIndex order: shoulder_pitch, shoulder_roll,
@@ -371,18 +372,25 @@ class JointSink(ActionSink):
     def make_rows(
         left_arm: np.ndarray,
         right_arm: np.ndarray,
-        left_hand: np.ndarray | None = None,
-        right_hand: np.ndarray | None = None,
+        left_hand: np.ndarray,
+        right_hand: np.ndarray,
         navigate: np.ndarray | None = None,
         base_height: np.ndarray | None = None,
     ) -> np.ndarray:
         """Assemble a (T, 22) chunk from its parts.
 
         ``left_arm``/``right_arm`` are (T, 7) radians (or (7,) for T=1).
-        Hands default to OPEN (-1) when omitted — there is no "hold" value
-        on this wire, so a grasping policy must pass its hand commands.
+        ``left_hand``/``right_hand`` are (T, 2) in [-1, 1] (-1 open, +1
+        closed) and are REQUIRED: there is no "hold" value on this wire, and
+        defaulting them would silently open or close a gripper mid-task.
         ``navigate`` (T, 3) and ``base_height`` (T,) default to zero.
         """
+        if left_hand is None or right_hand is None:
+            raise ActionError(
+                "left_hand and right_hand are required: pass (T, 2) commands in "
+                "[-1, 1] (-1 = open, +1 = closed) for every row; there is no "
+                "default that is safe mid-task"
+            )
         left = _rows(left_arm, ARM_DOF, "left_arm")
         right = _rows(right_arm, ARM_DOF, "right_arm")
         T = left.shape[0]
@@ -391,10 +399,8 @@ class JointSink(ActionSink):
         rows = np.zeros((T, JOINT_DIM), dtype=np.float32)
         rows[:, JOINT_SLICES["left_arm"]] = left
         rows[:, JOINT_SLICES["right_arm"]] = right
-        rows[:, JOINT_SLICES["left_hand"]] = (
-            -1.0 if left_hand is None else _rows(left_hand, 2, "left_hand", T))
-        rows[:, JOINT_SLICES["right_hand"]] = (
-            -1.0 if right_hand is None else _rows(right_hand, 2, "right_hand", T))
+        rows[:, JOINT_SLICES["left_hand"]] = _rows(left_hand, 2, "left_hand", T)
+        rows[:, JOINT_SLICES["right_hand"]] = _rows(right_hand, 2, "right_hand", T)
         if navigate is not None:
             rows[:, JOINT_SLICES["navigate_cmd"]] = _rows(navigate, 3, "navigate", T)
         if base_height is not None:
@@ -448,10 +454,12 @@ class JointSink(ActionSink):
     ):
         """Ask the adapter to move the arms to (``left_arm``, ``right_arm``).
 
-        ``max_speed`` is rad/s on the fastest joint; the adapter caps it at
-        its own ``--goto-max-speed`` (0.45 by default). ``hands`` is an
-        optional (left, right) pair in [-1, 1]; omitted means the grippers
-        are left as they are. Non-blocking.
+        ``max_speed`` is rad/s on the fastest joint, at least 0.01; the
+        adapter caps it at its own ``--goto-max-speed`` (0.45 by default)
+        and refuses a move that would take longer than 15 s at the
+        resulting speed. ``hands`` is an optional (left, right) pair in
+        [-1, 1]; omitted means the grippers are left as they are.
+        Non-blocking.
         """
         self._publish(_pack_goto(left_arm, right_arm, max_speed, hands, issued_at))
 
@@ -513,8 +521,9 @@ def _pack_goto(left_arm, right_arm, max_speed: float, hands, issued_at: float | 
     """The exact bytes ``JointSink.send_goto`` publishes (validated here)."""
     left = _rows(left_arm, ARM_DOF, "left_arm", 1)[0]
     right = _rows(right_arm, ARM_DOF, "right_arm", 1)[0]
-    if not (np.isfinite(max_speed) and max_speed > 0.0):
-        raise ActionError(f"max_speed must be a positive finite rad/s, got {max_speed!r}")
+    if not (np.isfinite(max_speed) and max_speed >= GOTO_MIN_SPEED):
+        raise ActionError(
+            f"max_speed must be a finite rad/s >= {GOTO_MIN_SPEED}, got {max_speed!r}")
     msg = {
         "left_arm": [float(v) for v in left],
         "right_arm": [float(v) for v in right],

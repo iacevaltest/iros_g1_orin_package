@@ -17,17 +17,19 @@ local edit here will pass your tests and fail on the robot.
 
 from __future__ import annotations
 
-from .actions import ActionSink, ActionError, DecoupledSink, SonicSink
+from .actions import ActionSink, ActionError, DecoupledSink, JointSink, SonicSink, arms_reached
 from .cameras import CameraStream, CAMERA_KEYS
 from .states import StateStream, RobotState
 
-LANES = ("sonic", "decoupled")
+LANES = ("sonic", "decoupled", "joint")
 
 __all__ = [
     "ActionSink",
     "ActionError",
     "SonicSink",
     "DecoupledSink",
+    "JointSink",
+    "arms_reached",
     "CameraStream",
     "CAMERA_KEYS",
     "StateStream",

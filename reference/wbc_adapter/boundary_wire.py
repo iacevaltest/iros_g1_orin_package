@@ -53,6 +53,9 @@ ARM_DOF = 7
 MAX_CHUNK_LENGTH = 64
 LATENT_ABS_BOUND = 1.25
 HAND_ABS_TOL = 1e-3
+# A goto slower than this is refused: below it the interpolation the
+# adapter builds would be thousands of waypoints long for any real move.
+GOTO_MIN_SPEED = 0.01
 
 # (T, 22) joint-lane row layout -- fixed, do not reorder. Arm angles are
 # radians in Unitree G1JointIndex order: shoulder_pitch, shoulder_roll,
@@ -117,7 +120,18 @@ def decode_joint(message: bytes) -> JointChunk:
     if dtype != "f32":
         raise ValueError(f"joint chunk dtype {dtype!r}, expected 'f32'")
     arr = np.frombuffer(msg["actions"], dtype=np.float32).reshape(msg["shape"])
-    return JointChunk(actions=arr, issued_at=float(msg.get("issued_at", 0.0)))
+    return JointChunk(actions=arr, issued_at=_issued_at(msg))
+
+
+def _issued_at(msg: dict) -> float:
+    """issued_at as sent; MISSING becomes NaN so validation rejects it
+    (the joint lane requires a stamp -- without one the staleness guard
+    has nothing to judge)."""
+    value = msg.get("issued_at")
+    try:
+        return float("nan") if value is None else float(value)
+    except (TypeError, ValueError):
+        return float("nan")
 
 
 def decode_goto(message: bytes) -> GotoRequest:
@@ -130,7 +144,7 @@ def decode_goto(message: bytes) -> GotoRequest:
         right_arm=np.asarray(msg["right_arm"], dtype=np.float64).reshape(-1),
         max_speed=float(msg["max_speed"]),
         hands=None if hands is None else np.asarray(hands, dtype=np.float64).reshape(-1),
-        issued_at=float(msg.get("issued_at", 0.0)),
+        issued_at=_issued_at(msg),
     )
 
 
@@ -249,6 +263,8 @@ def validate_joint(chunk: JointChunk) -> list[str]:
     peak = float(np.max(np.abs(hands)))
     if peak > 1.0 + HAND_ABS_TOL:
         problems.append(f"hand commands must lie in [-1, 1]; peak |value| = {peak:.3f}")
+    if not np.isfinite(chunk.issued_at):
+        problems.append("issued_at missing or not finite")
     return problems
 
 
@@ -259,8 +275,11 @@ def validate_goto(req: GotoRequest) -> list[str]:
             problems.append(f"{label} has shape {arm.shape}, expected ({ARM_DOF},)")
         elif not np.isfinite(arm).all():
             problems.append(f"{label} contains NaN or Inf")
-    if not (np.isfinite(req.max_speed) and req.max_speed > 0.0):
-        problems.append(f"max_speed must be a positive finite rad/s, got {req.max_speed!r}")
+    if not (np.isfinite(req.max_speed) and req.max_speed >= GOTO_MIN_SPEED):
+        problems.append(f"max_speed must be a finite rad/s >= {GOTO_MIN_SPEED}, "
+                        f"got {req.max_speed!r}")
+    if not np.isfinite(req.issued_at):
+        problems.append("issued_at missing or not finite")
     if req.hands is not None:
         if req.hands.shape != (2,):
             problems.append(f"hands has shape {req.hands.shape}, expected (2,)")

@@ -109,17 +109,18 @@ base_height)` assembles the rows and `JOINT_SLICES` names the columns.
 Validated before publish, and again by the adapter (a bad chunk is dropped
 and counted, like a bad `(T,25)` chunk): dtype floating (cast to float32),
 all finite, `1 ≤ T ≤ 64`, hand commands within `[-1, 1]` (1e-3
-tolerance). **Joint angles are not range-checked on the wire**; the adapter
-clamps them (next section) rather than dropping a chunk over a hair past a
-limit.
+tolerance), `issued_at` present and finite. **Joint angles are not
+range-checked on the wire**; the adapter clamps them (next section) rather
+than dropping a chunk over a hair past a limit. `make_rows` requires the
+hand commands for every row — there is no default that is safe mid-task.
 
 ### What the adapter does with a chunk
 
 In order, and nothing else:
 
-1. decode, validate; require fresh robot state (no state, no motion —
-   same refusal as `decoupled`); drop the chunk if `issued_at` is older
-   than `--max-chunk-age-s`;
+1. decode, validate; require robot state (no state, no motion — same
+   refusal as `decoupled`); drop the chunk if `issued_at` is older than
+   `--max-chunk-age-s`;
 2. **position clamp** each arm joint to the robot model's limits (below);
 3. **step clamp**: the same `--max-joint-vel` / `--chunk-hz` rate limit
    the IK output gets, anchored on the freshly measured arms for the first
@@ -153,23 +154,27 @@ that is visible in your own published rows, and it is yours.
 ### `goto` — move to a start pose
 
 Wire: `b"goto"` + msgpack `{"left_arm": [7 floats], "right_arm": [7 floats],
-"max_speed": <rad/s>, "hands": [left, right] (optional), "issued_at":
-<float>}`. `JointSink.send_goto(left_arm, right_arm, max_speed=0.3,
-hands=None)` sends it.
+"max_speed": <rad/s, ≥ 0.01>, "hands": [left, right] (optional),
+"issued_at": <float, required>}`. `JointSink.send_goto(left_arm, right_arm,
+max_speed=0.3, hands=None)` sends it.
 
-The adapter reads the measured arms, position-clamps the target, builds a
-straight-line joint interpolation from measured to target at
-`min(max_speed, --goto-max-speed [0.45], --max-joint-vel)` sampled at
-`--chunk-hz`, and publishes it as **one** multi-waypoint goal through the
-same step clamp → mapper → publish path. The final waypoint is exactly the
-(clamped) target. `hands`, if given, is relayed to the grippers once;
-omitted, the grippers stay as they are. The base keeps the last commanded
-`navigate_cmd` / `base_height_cmd` (the controller's defaults if nothing was
-commanded yet). A stale `goto` is dropped like a stale chunk.
+The adapter requires robot state that its controller backend reports as
+**fresh** (a stale state refuses the request), position-clamps the target,
+builds a straight-line joint interpolation from the measured arms to the
+target at `min(max_speed, --goto-max-speed [0.45], --max-joint-vel)`
+sampled at `--chunk-hz`, and publishes it as **one** multi-waypoint goal
+through the same step clamp → mapper → publish path. The final waypoint is
+exactly the (clamped) target. A move that would take longer than **15 s**
+at that speed is refused (counted and logged) — ask for a faster move or a
+nearer pose. `hands`, if given, is relayed to the grippers once; omitted,
+the grippers stay as they are. The base **stands still** for the whole
+move (`navigate_cmd` is zero regardless of what the last chunk commanded)
+at the last commanded `base_height_cmd` (the controller's default height if
+nothing was commanded yet). A stale `goto` is dropped like a stale chunk.
 
 It **does not block**. The adapter keeps the trajectory alive (its
-keepalive re-sends the part still ahead, then holds the final pose); you
-decide arrival by watching `body_q` on `:5557` —
+keepalive re-sends the waypoints due within the next 2 s, then holds the
+final pose); you decide arrival by watching `body_q` on `:5557` —
 `boundary.actions.arms_reached(body_q, left_arm, right_arm, tol_rad=0.05)`
 is the check. Do not publish chunks while a `goto` is under way: `:5556` is
 newest-wins, so a later chunk supersedes it, and a chunk sent in the same
@@ -239,7 +244,7 @@ change an outcome. They will not change mid-series.
 | `--chunk-hz` | `20.0` | Scheduling rate |
 | `--joint-lane` | `on` | Whether `b"joint"` / `b"goto"` are accepted at all |
 | `--joint-lane-limits` | `urdf` | Which position limits the `joint` lane clamps to (see [Limits and clamps](#limits-and-clamps)) |
-| `--goto-max-speed` | `0.45` | Ceiling on a `goto` request's speed, rad/s |
+| `--goto-max-speed` | `0.45` | Ceiling on a `goto` request's speed, rad/s (must be > 0; a move over 15 s is refused) |
 
 `--ik-warm-start current` is not a tuning preference. Warm-starting from the
 *previous solution* made results depend on message arrival order — the same 8

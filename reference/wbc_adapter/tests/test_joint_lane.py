@@ -596,23 +596,27 @@ class Goto(unittest.TestCase):
         with contextlib.redirect_stdout(io.StringIO()):
             wbc_driver._handle_goto(ctx, goto_msg(self.TARGET_LEFT, self.TARGET_RIGHT, max_speed=0.3))
         goto_goal = ctx.backend.goals[0]
-        # keepalive while the whole trajectory is still ahead: same waypoints, same times
+        # keepalive while the whole trajectory is still ahead: the next 2 s
+        # of it, as a prefix -- same waypoints, same times
         self.assertTrue(wbc_driver._publish_keepalive(ctx))
         ka = ctx.backend.goals[1]
-        np.testing.assert_allclose(np.asarray(ka["target_time"]), np.asarray(goto_goal["target_time"]))
+        k = len(ka["target_time"])
+        self.assertGreaterEqual(k, 1)
+        self.assertLessEqual(k, int(wbc_driver.GOTO_KEEPALIVE_WINDOW_S * CHUNK_HZ) + 1)
+        np.testing.assert_allclose(np.asarray(ka["target_time"]),
+                                   np.asarray(goto_goal["target_time"][:k]))
         np.testing.assert_allclose(np.asarray(ka["target_upper_body_pose"]),
-                                   np.asarray(goto_goal["target_upper_body_pose"]))
+                                   np.asarray(goto_goal["target_upper_body_pose"][:k]))
         self.assertEqual(ctx.keepalives_sent, 1)
         # half way through: only the future half is re-sent
         now = time.monotonic()
         ctx.goto_in_flight["times"] = [now - 1.0 + i * DT for i in range(60)]
         wbc_driver._publish_keepalive(ctx)
         ka2 = ctx.backend.goals[2]
-        self.assertTrue(all(t > now for t in ka2["target_time"]))
+        self.assertTrue(all(now < t <= now + wbc_driver.GOTO_KEEPALIVE_WINDOW_S + 1e-6
+                            for t in ka2["target_time"]))
         self.assertLess(len(ka2["target_time"]), 60)
         self.assertGreater(len(ka2["target_time"]), 0)
-        np.testing.assert_allclose(ka2["target_upper_body_pose"][-1],
-                                   goto_goal["target_upper_body_pose"][-1])
         # trajectory done: plain single-row hold of the final pose
         ctx.goto_in_flight["times"] = [now - 10.0 + i * DT for i in range(60)]
         wbc_driver._publish_keepalive(ctx)
@@ -847,21 +851,27 @@ class ClientLibrary(unittest.TestCase):
         self.assertEqual(JOINT_SLICES["left_hand"], TASKSPACE_SLICES["left_hand"])
         self.assertEqual(JOINT_SLICES["navigate_cmd"], TASKSPACE_SLICES["navigate_cmd"])
         self.assertEqual(JOINT_SLICES["base_height_cmd"], TASKSPACE_SLICES["base_height_cmd"])
-        # defaults: hands open, base commands zero; single-row inputs allowed
-        one = JointSink.make_rows(LEFT_ARM, RIGHT_ARM)
+        # base commands default to zero; single-row inputs allowed; hands required
+        one = JointSink.make_rows(LEFT_ARM, RIGHT_ARM, [1.0, 1.0], [-1.0, -1.0])
         self.assertEqual(one.shape, (1, 22))
-        np.testing.assert_allclose(one[0, 0:4], -1.0)
+        np.testing.assert_allclose(one[0, 0:4], [1.0, 1.0, -1.0, -1.0])
         np.testing.assert_allclose(one[0, 18:22], 0.0)
+        with self.assertRaises(ValueError) as cm:      # ActionError is a ValueError
+            JointSink.make_rows(LEFT_ARM, RIGHT_ARM, None, [-1.0, -1.0])
+        self.assertIn("-1 = open, +1 = closed", str(cm.exception))
+        with self.assertRaises(ValueError):
+            JointSink.make_rows(LEFT_ARM, RIGHT_ARM, [1.0, 1.0], None)
         self.assertEqual(JointSink.validate_chunk(rows).shape, (T, 22))
 
     def test_make_rows_rejects_mismatch(self):
         from boundary.actions import ActionError, JointSink
+        h = np.zeros((2, 2))
         with self.assertRaises(ActionError):
-            JointSink.make_rows(np.zeros((2, 7)), np.zeros((3, 7)))
+            JointSink.make_rows(np.zeros((2, 7)), np.zeros((3, 7)), h, h)
         with self.assertRaises(ActionError):
-            JointSink.make_rows(np.zeros((2, 6)), np.zeros((2, 7)))
+            JointSink.make_rows(np.zeros((2, 6)), np.zeros((2, 7)), h, h)
         with self.assertRaises(ActionError):
-            JointSink.make_rows(np.zeros((2, 7)), np.zeros((2, 7)), left_hand=np.zeros((1, 2)))
+            JointSink.make_rows(np.zeros((2, 7)), np.zeros((2, 7)), np.zeros((1, 2)), h)
 
     def test_validate_chunk_mirrors_adapter(self):
         from boundary.actions import ActionError, JointSink
@@ -925,6 +935,216 @@ class ClientLibrary(unittest.TestCase):
             arms_reached(Q43, LEFT_ARM, RIGHT_ARM)     # 43-wide is the WBC's q, not body_q
         with self.assertRaises(ActionError):
             arms_reached(q29, LEFT_ARM[:6], RIGHT_ARM)
+
+
+# ---------------------------------------------------------------------------
+# 8. review fixes
+# ---------------------------------------------------------------------------
+
+
+def raw_goto_msg(left, right, max_speed, hands=None, issued_at="now") -> bytes:
+    """A goto frame built without the client's validation, to hit the
+    adapter's own checks. issued_at=None omits the key."""
+    msg = {"left_arm": [float(v) for v in left], "right_arm": [float(v) for v in right],
+           "max_speed": max_speed, "hands": hands}
+    if issued_at == "now":
+        msg["issued_at"] = time.time()
+    elif issued_at is not None:
+        msg["issued_at"] = issued_at
+    return b"goto" + msgpack.packb(msg, use_bin_type=True)
+
+
+def raw_joint_msg(rows, issued_at="now") -> bytes:
+    rows = np.asarray(rows, dtype=np.float32)
+    msg = {"actions": rows.tobytes(), "shape": list(rows.shape), "dtype": "f32"}
+    if issued_at == "now":
+        msg["issued_at"] = time.time()
+    elif issued_at is not None:
+        msg["issued_at"] = issued_at
+    return b"joint" + msgpack.packb(msg, use_bin_type=True)
+
+
+class ReviewFixes(unittest.TestCase):
+    FAR_LEFT = LEFT_ARM + np.array([0.0, 0.0, 0.0, 0.9, 0.0, 0.0, 0.0])
+
+    def test_1_tiny_speed_and_long_moves_are_refused_and_loop_survives(self):
+        # handler level: each is rejected and counted, none raises
+        for speed, what in ((1e-9, "max_speed"), (0.005, "max_speed"), (0.01, "cap")):
+            ctx = make_ctx()
+            with contextlib.redirect_stderr(io.StringIO()) as err:
+                wbc_driver._handle_goto(ctx, raw_goto_msg(self.FAR_LEFT, RIGHT_ARM, speed))
+            self.assertEqual(ctx.backend.goals, [], speed)
+            self.assertEqual(ctx.stats.goto_rejected, 1, speed)
+            self.assertEqual(ctx.stats.rejected, 1, speed)
+            self.assertIn(what, err.getvalue())
+        # 0.9 rad at 0.01 rad/s = 90 s: over the 15 s cap even though the speed is legal
+        self.assertEqual(boundary_wire.validate_goto(boundary_wire.decode_goto(
+            raw_goto_msg(self.FAR_LEFT, RIGHT_ARM, 0.01))), [])
+        # a legal, in-cap move right at the floor still works
+        ctx = make_ctx()
+        with contextlib.redirect_stdout(io.StringIO()):
+            wbc_driver._handle_goto(ctx, raw_goto_msg(LEFT_ARM + 0.1, RIGHT_ARM, 0.01))
+        self.assertEqual(len(ctx.backend.goals), 1)
+        self.assertEqual(len(ctx.backend.goals[0]["target_time"]), 200)   # 10 s
+        # loop level: three bad gotos, then a taskspace chunk still publishes
+        script = [lambda: raw_goto_msg(self.FAR_LEFT, RIGHT_ARM, 1e-9),
+                  lambda: raw_goto_msg(self.FAR_LEFT, RIGHT_ARM, 0.005),
+                  lambda: raw_goto_msg(self.FAR_LEFT, RIGHT_ARM, 0.01),
+                  lambda: taskspace_msg(taskspace_rows(T=2))]
+        with contextlib.redirect_stderr(io.StringIO()):
+            backend, stats = drive(wbc_driver, make_args(), script)
+        self.assertEqual(len(backend.goals), 1)
+        self.assertEqual(stats.goto_rejected, 3)
+        self.assertEqual(stats.published, 1)
+
+    def test_1_injected_exception_fails_closed(self):
+        real = wbc_driver._position_clamp
+
+        def boom(ctx, arms):
+            raise RuntimeError("injected")
+        wbc_driver._position_clamp = boom
+        try:
+            ctx = make_ctx()
+            with contextlib.redirect_stderr(io.StringIO()) as err:
+                wbc_driver._handle_joint(ctx, joint_msg(joint_rows(T=2)))
+                wbc_driver._handle_goto(ctx, goto_msg(self.FAR_LEFT, RIGHT_ARM))
+            self.assertEqual(ctx.backend.goals, [])
+            self.assertEqual(ctx.stats.joint_rejected, 1)
+            self.assertEqual(ctx.stats.goto_rejected, 1)
+            self.assertEqual(ctx.stats.rejected, 2)
+            self.assertEqual(err.getvalue().count("injected"), 2)
+            self.assertIn("holding last safe goal", err.getvalue())
+        finally:
+            wbc_driver._position_clamp = real
+        # and the lane works again afterwards
+        wbc_driver._handle_joint(ctx, joint_msg(joint_rows(T=2)))
+        self.assertEqual(len(ctx.backend.goals), 1)
+
+    def test_2_goto_max_speed_must_be_positive(self):
+        parser = wbc_driver.build_parser()
+        for bad in ("0", "-1", "0.0", "nan", "x"):
+            with contextlib.redirect_stderr(io.StringIO()) as err, self.assertRaises(SystemExit):
+                parser.parse_args(["--lane", "decoupled", "--goto-max-speed", bad])
+            self.assertIn("goto-max-speed", err.getvalue())
+        args = parser.parse_args(["--lane", "decoupled", "--goto-max-speed", "0.5"])
+        self.assertEqual(args.goto_max_speed, 0.5)
+        self.assertEqual(parser.parse_args(["--lane", "decoupled"]).goto_max_speed, 0.45)
+
+    def test_3_goto_keepalive_resends_a_bounded_window(self):
+        ctx = make_ctx()
+        with contextlib.redirect_stdout(io.StringIO()):
+            wbc_driver._handle_goto(ctx, goto_msg(self.FAR_LEFT, RIGHT_ARM, max_speed=0.075))
+        goal = ctx.backend.goals[0]
+        self.assertEqual(len(goal["target_time"]), 240)          # 12 s, inside the 15 s cap
+        for _ in range(3):
+            now = time.monotonic()
+            self.assertTrue(wbc_driver._publish_keepalive(ctx))
+            ka = ctx.backend.goals[-1]
+            self.assertLessEqual(len(ka["target_time"]), int(2.0 * CHUNK_HZ) + 1)
+            self.assertGreaterEqual(len(ka["target_time"]), 1)
+            self.assertTrue(all(t > now for t in ka["target_time"]))
+            np.testing.assert_allclose(np.diff(ka["target_time"]), DT, atol=1e-9)
+        # the plain hold (no goto in flight) is the pre-existing one-row form
+        ctx.goto_in_flight = None
+        wbc_driver._publish_keepalive(ctx)
+        self.assertEqual(len(ctx.backend.goals[-1]["target_time"]), 1)
+
+    def test_4_goto_stands_still_at_the_last_height(self):
+        ctx = make_ctx()
+        rows = taskspace_rows(T=3)
+        rows[:, 18:21] = [0.3, 0.0, 0.2]       # walking
+        rows[:, 21] = 0.68
+        wbc_driver._handle_taskspace(ctx, taskspace_msg(rows))
+        np.testing.assert_allclose(ctx.last_goal_template["navigate_cmd"], [0.3, 0.0, 0.2])
+        with contextlib.redirect_stdout(io.StringIO()):
+            wbc_driver._handle_goto(ctx, goto_msg(self.FAR_LEFT, RIGHT_ARM, max_speed=0.3))
+        goal = ctx.backend.goals[1]
+        for nav in goal["navigate_cmd"]:
+            np.testing.assert_allclose(nav, [0.0, 0.0, 0.0])
+        for bh in goal["base_height_command"]:
+            np.testing.assert_allclose(bh, [0.68], atol=1e-6)
+        # ...and the keepalive after it holds the same
+        wbc_driver._publish_keepalive(ctx)
+        np.testing.assert_allclose(ctx.backend.goals[2]["navigate_cmd"][0], [0.0, 0.0, 0.0])
+
+    def test_5_make_rows_requires_hands(self):
+        from boundary.actions import ActionError, JointSink
+        with self.assertRaises(ActionError):
+            JointSink.make_rows(LEFT_ARM, RIGHT_ARM, None, None)
+        with self.assertRaises(TypeError):
+            JointSink.make_rows(LEFT_ARM, RIGHT_ARM)        # no longer optional
+
+    def test_6_missing_or_nan_issued_at_rejected(self):
+        for bad in (None, float("nan"), float("inf")):
+            ctx = make_ctx()
+            with contextlib.redirect_stderr(io.StringIO()) as err:
+                wbc_driver._handle_joint(ctx, raw_joint_msg(joint_rows(T=2), issued_at=bad))
+                wbc_driver._handle_goto(ctx, raw_goto_msg(LEFT_ARM + 0.1, RIGHT_ARM, 0.3, issued_at=bad))
+            self.assertEqual(ctx.backend.goals, [], bad)
+            self.assertEqual(ctx.stats.joint_rejected, 1, bad)
+            self.assertEqual(ctx.stats.goto_rejected, 1, bad)
+            self.assertEqual(ctx.stats.stale, 0, bad)
+            self.assertEqual(err.getvalue().count("issued_at missing or not finite"), 2)
+        # taskspace keeps its pre-existing behaviour: a missing stamp is age 0
+        msg = b"taskspace" + msgpack.packb({"actions": taskspace_rows(T=1).tobytes(),
+                                            "shape": [1, 25]}, use_bin_type=True)
+        ctx = make_ctx()
+        wbc_driver._handle_taskspace(ctx, msg)
+        self.assertEqual(len(ctx.backend.goals), 1)
+
+    def test_7_zero_max_waypoints_does_not_raise(self):
+        ctx = make_ctx(max_waypoints=0)
+        wbc_driver._handle_joint(ctx, joint_msg(joint_rows(T=3)))
+        wbc_driver._handle_taskspace(ctx, taskspace_msg(taskspace_rows(T=2)))
+        self.assertEqual(ctx.backend.goals, [])
+        self.assertEqual(ctx.stats.joint_accepted, 0)
+        self.assertEqual(ctx.stats.joint_rejected, 0)
+
+    def test_8_stale_state_refuses_goto_only(self):
+        class Stale(FakeBackend):
+            def health(self):
+                return {"backend": "fake", "state_stale": True}
+        ctx = make_ctx(backend=Stale())
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            wbc_driver._handle_goto(ctx, goto_msg(self.FAR_LEFT, RIGHT_ARM))
+        self.assertEqual(ctx.backend.goals, [])
+        self.assertEqual(ctx.stats.goto_rejected, 1)
+        self.assertIn("state stale, goto refused", err.getvalue())
+        wbc_driver._handle_joint(ctx, joint_msg(joint_rows(T=2)))
+        self.assertEqual(len(ctx.backend.goals), 1)
+
+    def test_9_boundary_package_exports_the_lane(self):
+        import boundary
+        self.assertIn("joint", boundary.LANES)
+        self.assertIn("JointSink", boundary.__all__)
+        self.assertIs(boundary.JointSink, boundary.actions.JointSink)
+        self.assertIn("arms_reached", boundary.__all__)
+
+    def test_10_limits_failure_disables_the_lane_but_not_the_run(self):
+        real = wbc_driver._load_arm_limits
+
+        def boom(mode, mapper, settings):
+            raise RuntimeError("no limits today")
+        wbc_driver._load_arm_limits = boom
+        try:
+            script = [lambda: joint_msg(joint_rows(T=2)),
+                      lambda: goto_msg(self.FAR_LEFT, RIGHT_ARM),
+                      lambda: joint_msg(joint_rows(T=2)),
+                      lambda: taskspace_msg(taskspace_rows(T=2))]
+            with contextlib.redirect_stderr(io.StringIO()) as err:
+                backend, stats = drive(wbc_driver, make_args(), script)
+        finally:
+            wbc_driver._load_arm_limits = real
+        self.assertEqual(len(backend.goals), 1)          # the taskspace chunk
+        self.assertIn("wrist_pose", backend.goals[0])
+        self.assertEqual(stats.joint_rejected, 2)
+        self.assertEqual(stats.goto_rejected, 1)
+        self.assertEqual(stats.rejected, 3)
+        self.assertEqual(stats.published, 1)
+        log = err.getvalue()
+        self.assertIn("joint lane DISABLED", log)
+        self.assertIn("no limits today", log)
+        self.assertEqual(log.count("joint lane disabled this run"), 1)   # logged once
 
 
 if __name__ == "__main__":
