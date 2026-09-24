@@ -15,7 +15,18 @@ template:
   decoupled : TASKSPACE_TOPIC + msgpack({"actions": <float32 bytes>,
                                          "shape": [T, 25],
                                          "issued_at": float})
+  joint     : JOINT_TOPIC + msgpack({"actions": <float32 bytes>,
+                                     "shape": [T, 22], "dtype": "f32",
+                                     "issued_at": float})
+              GOTO_TOPIC + msgpack({"left_arm": [7], "right_arm": [7],
+                                    "max_speed": float, "hands": [2] (opt),
+                                    "issued_at": float})
   sonic     : POSE_TOPIC + <1280B JSON header, NUL-padded> + <raw buffers>
+
+The joint lane is carried on the same :5556 socket as the decoupled lane
+and consumed by the same adapter process (wbc_driver.py --lane decoupled);
+it differs only in what a row means -- arm joint angles instead of wrist
+poses, so no IK is involved. See docs/CONTRACT.md, "The joint lane".
 
 Nothing here is team-specific. Do not add team-specific handling to this
 module -- if a team needs special treatment at this layer, they are off
@@ -33,9 +44,27 @@ import numpy as np
 # adapter does not depend on any one team's checkout of the template.
 POSE_TOPIC = b"pose"
 TASKSPACE_TOPIC = b"taskspace"
+JOINT_TOPIC = b"joint"
+GOTO_TOPIC = b"goto"
 HEADER_SIZE = 1280
 TASKSPACE_DIM = 25
+JOINT_DIM = 22
+ARM_DOF = 7
+MAX_CHUNK_LENGTH = 64
 LATENT_ABS_BOUND = 1.25
+HAND_ABS_TOL = 1e-3
+
+# (T, 22) joint-lane row layout -- fixed, do not reorder. Arm angles are
+# radians in Unitree G1JointIndex order: shoulder_pitch, shoulder_roll,
+# shoulder_yaw, elbow, wrist_roll, wrist_pitch, wrist_yaw.
+JOINT_SLICES = {
+    "left_hand": slice(0, 2),
+    "right_hand": slice(2, 4),
+    "left_arm": slice(4, 11),
+    "right_arm": slice(11, 18),
+    "navigate_cmd": slice(18, 21),
+    "base_height_cmd": slice(21, 22),
+}
 
 _TAG_DTYPE = {"f32": np.float32, "f64": np.float64, "i32": np.int32,
               "i64": np.int64, "u8": np.uint8, "bool": np.bool_}
@@ -54,12 +83,55 @@ class PoseStep:
     fields: dict[str, np.ndarray]
 
 
+@dataclass
+class JointChunk:
+    """One `joint`-lane chunk: (T, 22) hands + arm joint angles + base cmds."""
+    actions: np.ndarray   # (T, 22) float32
+    issued_at: float
+
+
+@dataclass
+class GotoRequest:
+    """One `joint`-lane "go to pose" request: a target arm configuration the
+    adapter interpolates to from the measured arms, at a bounded speed."""
+    left_arm: np.ndarray            # (7,) radians, G1JointIndex order
+    right_arm: np.ndarray           # (7,)
+    max_speed: float                # rad/s, further capped by the adapter
+    hands: np.ndarray | None        # (2,) -1 open .. +1 closed, or None = hold
+    issued_at: float
+
+
 def decode_taskspace(message: bytes) -> TaskspaceChunk:
     if not message.startswith(TASKSPACE_TOPIC):
         raise ValueError(f"frame does not start with topic {TASKSPACE_TOPIC!r}")
     msg = msgpack.unpackb(message[len(TASKSPACE_TOPIC):], raw=False)
     arr = np.frombuffer(msg["actions"], dtype=np.float32).reshape(msg["shape"])
     return TaskspaceChunk(actions=arr, issued_at=float(msg.get("issued_at", 0.0)))
+
+
+def decode_joint(message: bytes) -> JointChunk:
+    if not message.startswith(JOINT_TOPIC):
+        raise ValueError(f"frame does not start with topic {JOINT_TOPIC!r}")
+    msg = msgpack.unpackb(message[len(JOINT_TOPIC):], raw=False)
+    dtype = msg.get("dtype", "f32")
+    if dtype != "f32":
+        raise ValueError(f"joint chunk dtype {dtype!r}, expected 'f32'")
+    arr = np.frombuffer(msg["actions"], dtype=np.float32).reshape(msg["shape"])
+    return JointChunk(actions=arr, issued_at=float(msg.get("issued_at", 0.0)))
+
+
+def decode_goto(message: bytes) -> GotoRequest:
+    if not message.startswith(GOTO_TOPIC):
+        raise ValueError(f"frame does not start with topic {GOTO_TOPIC!r}")
+    msg = msgpack.unpackb(message[len(GOTO_TOPIC):], raw=False)
+    hands = msg.get("hands")
+    return GotoRequest(
+        left_arm=np.asarray(msg["left_arm"], dtype=np.float64).reshape(-1),
+        right_arm=np.asarray(msg["right_arm"], dtype=np.float64).reshape(-1),
+        max_speed=float(msg["max_speed"]),
+        hands=None if hands is None else np.asarray(hands, dtype=np.float64).reshape(-1),
+        issued_at=float(msg.get("issued_at", 0.0)),
+    )
 
 
 def decode_pose(message: bytes) -> PoseStep:
@@ -152,6 +224,50 @@ def validate_taskspace(chunk: TaskspaceChunk) -> list[str]:
                 f"{label} EE quaternion not unit length "
                 f"(min {norms.min():.4f}, max {norms.max():.4f})"
             )
+    return problems
+
+
+def validate_joint(chunk: JointChunk) -> list[str]:
+    """`joint`-lane contract checks: shape, chunk length, finiteness and
+    the hand range. Joint angles are NOT range-checked here -- the adapter
+    clamps them to the robot model's limits (and counts every clamp), which
+    is the safer response to a policy that overshoots a limit by a hair.
+    """
+    problems = []
+    arr = chunk.actions
+    if arr.ndim != 2 or arr.shape[1] != JOINT_DIM:
+        problems.append(f"actions have shape {arr.shape}, expected (T, {JOINT_DIM})")
+        return problems
+    if not 1 <= arr.shape[0] <= MAX_CHUNK_LENGTH:
+        problems.append(f"chunk length T={arr.shape[0]} outside 1..{MAX_CHUNK_LENGTH}")
+        return problems
+    if not np.isfinite(arr).all():
+        problems.append("actions contain NaN or Inf")
+        return problems
+    hands = np.concatenate([arr[:, JOINT_SLICES["left_hand"]],
+                            arr[:, JOINT_SLICES["right_hand"]]], axis=1)
+    peak = float(np.max(np.abs(hands)))
+    if peak > 1.0 + HAND_ABS_TOL:
+        problems.append(f"hand commands must lie in [-1, 1]; peak |value| = {peak:.3f}")
+    return problems
+
+
+def validate_goto(req: GotoRequest) -> list[str]:
+    problems = []
+    for label, arm in (("left_arm", req.left_arm), ("right_arm", req.right_arm)):
+        if arm.shape != (ARM_DOF,):
+            problems.append(f"{label} has shape {arm.shape}, expected ({ARM_DOF},)")
+        elif not np.isfinite(arm).all():
+            problems.append(f"{label} contains NaN or Inf")
+    if not (np.isfinite(req.max_speed) and req.max_speed > 0.0):
+        problems.append(f"max_speed must be a positive finite rad/s, got {req.max_speed!r}")
+    if req.hands is not None:
+        if req.hands.shape != (2,):
+            problems.append(f"hands has shape {req.hands.shape}, expected (2,)")
+        elif not np.isfinite(req.hands).all():
+            problems.append("hands contain NaN or Inf")
+        elif float(np.max(np.abs(req.hands))) > 1.0 + HAND_ABS_TOL:
+            problems.append("hands must lie in [-1, 1]")
     return problems
 
 
