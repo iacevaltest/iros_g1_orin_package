@@ -192,7 +192,7 @@ class TestFieldOfViewFromCalibration(unittest.TestCase):
         vfov = math.degrees(2 * math.atan(240 / fy))
         self.assertAlmostEqual(hfov, 87.0, delta=0.6)
         self.assertAlmostEqual(vfov, 71.0, delta=0.6)
-        # and the module's hard-coded matrix is the same calibration
+        # and the bridge loaded this same file
         self.assertAlmostEqual(bridge._CAM_MATRIX_LEFT[0, 0], fx)
         self.assertAlmostEqual(bridge._CAM_MATRIX_LEFT[1, 1], fy)
 

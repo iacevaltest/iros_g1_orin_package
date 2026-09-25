@@ -156,6 +156,9 @@ ps -eo pid,args | grep -E "g1_policy_bridge|run_g1_control_loop|g1_deploy_onnx_r
 ```bash
 # Terminal A1 — camera half (needs pyrealsense2/cv2 — different env)
 conda activate teleimager
+# head stereo calibration for THIS rig; the script reads it at startup and
+# prints the values it loaded. Required when EGO_VIEW_RECTIFY=1.
+export HEAD_CAMERA_CALIBRATION=~/iros_g1_orin_package/config/head_camera_calibration.yaml
 python ~/real_orin_cameras.py &
 
 # Terminal A2 — state half (needs unitree_sdk2py/cyclonedds — different env)
@@ -466,7 +469,7 @@ configured entirely by environment variables, so `--help` does nothing.
 | `EGO_VIEW_EYE` | `left` | Which half of the `1280×480` side-by-side frame becomes `ego_view` |
 | `EGO_VIEW_RECTIFY` | `0` | Set `1` to rectify. Off by default — reference data is unrectified |
 | `PUBLISH_STEREO` | `1` | Also publish `ego_view_left` / `ego_view_right` |
-| `HEAD_CAMERA_CALIBRATION` | `config/head_camera_calibration.yaml` | Calibration file path |
+| `HEAD_CAMERA_CALIBRATION` | `config/head_camera_calibration.yaml` (repo-relative) | Head stereo calibration, read at startup. Set it explicitly when the script is copied out of the repo |
 
 Wrist serials are **per-robot and have no default**. Find yours with
 `tools/diagnose_cameras.py`.
