@@ -605,6 +605,87 @@ class WristRollPostureWeight(unittest.TestCase):
                 self.assertAlmostEqual(v, 1.25)             # held: measured pose passed through
 
 
+class CrossLaneHold(unittest.TestCase):
+    """The IK's hold-on-reject fallback (`UpperBodyIK._last_good`) is only
+    ever written by pose-lane solves. Without a reset, a team that runs a
+    joint-lane phase (goto plus joint chunks) and then returns to the pose
+    lane would, on its first reject, be commanded the LAST pose-lane
+    solution from before that phase. An accepted joint-lane message now
+    calls `reset_hold()`, so that reject holds the measured arms instead,
+    as on a fresh start."""
+
+    MEASURED = np.r_[LEFT_ARM, RIGHT_ARM]
+
+    @staticmethod
+    def _unreachable_rows(T=1):
+        rows = taskspace_rows(T=T)
+        rows[:, 4:7] = [3.0, 0.3, 0.0]        # 3 m out: no arm reaches it
+        rows[:, 11:14] = [3.0, -0.3, 0.0]
+        return rows
+
+    @staticmethod
+    def _arms(goal, k=0):
+        wp = np.asarray(goal["target_upper_body_pose"][k], dtype=np.float64)
+        return np.r_[wp[0:7], wp[14:21]]
+
+    def _reject(self, ctx):
+        n_left, n_right = ctx.stats.left_ok, ctx.stats.right_ok
+        with contextlib.redirect_stderr(io.StringIO()):
+            wbc_driver._handle_taskspace(ctx, taskspace_msg(self._unreachable_rows()))
+        self.assertEqual((ctx.stats.left_ok, ctx.stats.right_ok), (n_left, n_right))  # both rejected
+        return self._arms(ctx.backend.goals[-1])
+
+    def test_joint_chunk_clears_the_hold(self):
+        s = solver()
+        s.reset_hold()
+        self.assertIsNone(s._last_good)
+        ctx = make_ctx(max_joint_vel=0)          # no step clamp: the hold passes through verbatim
+        wbc_driver._handle_taskspace(ctx, taskspace_msg(taskspace_rows(T=2)))
+        self.assertIsNotNone(s._last_good)
+        held = s._last_good[:14].copy()
+        self.assertGreater(np.abs(held - self.MEASURED).max(), 0.02)
+        # pre-existing behaviour: a reject re-commands that solution
+        np.testing.assert_allclose(self._reject(ctx), held, atol=1e-9)
+        # an accepted joint chunk clears it...
+        wbc_driver._handle_joint(ctx, joint_msg(joint_rows(T=2)))
+        self.assertEqual(ctx.stats.joint_accepted, 1)
+        self.assertIsNone(s._last_good)
+        # ...so the next reject holds the MEASURED arms, not the old solution
+        np.testing.assert_allclose(self._reject(ctx), self.MEASURED, atol=1e-9)
+        # and a good solve repopulates it as before
+        wbc_driver._handle_taskspace(ctx, taskspace_msg(taskspace_rows(T=1)))
+        self.assertIsNotNone(s._last_good)
+
+    def test_goto_clears_the_hold(self):
+        s = solver()
+        ctx = make_ctx(max_joint_vel=0)
+        wbc_driver._handle_taskspace(ctx, taskspace_msg(taskspace_rows(T=2)))
+        self.assertIsNotNone(s._last_good)
+        with contextlib.redirect_stdout(io.StringIO()):
+            wbc_driver._handle_goto(ctx, goto_msg(LEFT_ARM + 0.1, RIGHT_ARM, max_speed=0.3))
+        self.assertEqual(ctx.stats.goto_accepted, 1)
+        self.assertIsNone(s._last_good)
+        np.testing.assert_allclose(self._reject(ctx), self.MEASURED, atol=1e-9)
+
+    def test_rejected_joint_messages_keep_the_hold(self):
+        s = solver()
+        ctx = make_ctx(max_joint_vel=0)
+        wbc_driver._handle_taskspace(ctx, taskspace_msg(taskspace_rows(T=1)))
+        held = s._last_good.copy()
+        with contextlib.redirect_stderr(io.StringIO()):
+            wbc_driver._handle_joint(ctx, joint_msg(joint_rows(T=2), issued_at=time.time() - 5.0))
+        self.assertEqual(ctx.stats.joint_accepted, 0)
+        np.testing.assert_array_equal(s._last_good, held)
+
+    def test_no_solver_in_bench_mode_is_fine(self):
+        ctx = make_ctx()
+        ctx.solver = None
+        wbc_driver._handle_joint(ctx, joint_msg(joint_rows(T=2)))
+        with contextlib.redirect_stdout(io.StringIO()):
+            wbc_driver._handle_goto(ctx, goto_msg(LEFT_ARM + 0.1, RIGHT_ARM, max_speed=0.3))
+        self.assertEqual((ctx.stats.joint_accepted, ctx.stats.goto_accepted), (1, 1))
+
+
 # ---------------------------------------------------------------------------
 # 4. validation
 # ---------------------------------------------------------------------------

@@ -798,6 +798,16 @@ def _handle_joint(ctx: _DecoupledContext, msg: bytes):
               f"{type(exc).__name__}: {exc}", file=sys.stderr)
 
 
+def _reset_ik_hold(ctx: _DecoupledContext):
+    """An accepted joint-lane message moves the arms without the IK
+    seeing it, so the IK's hold-on-reject fallback (its last accepted
+    pose-lane solution) may now be a different stage's pose. Drop it: the
+    next pose-lane reject then holds the measured arms, as on a fresh
+    start. No solver in bench mode."""
+    if ctx.solver is not None:
+        ctx.solver.reset_hold()
+
+
 def _apply_joint_chunk(ctx: _DecoupledContext, chunk):
     args, stats = ctx.args, ctx.stats
     body_q = _read_body_q(ctx)
@@ -826,6 +836,7 @@ def _apply_joint_chunk(ctx: _DecoupledContext, chunk):
 
     n = len(waypoints)
     stats.joint_accepted += 1
+    _reset_ik_hold(ctx)
     goal, _ = _publish_trajectory(
         ctx, waypoints,
         [[float(r[21])] for r in rows[:n]],
@@ -933,6 +944,7 @@ def _apply_goto(ctx: _DecoupledContext, req):
     navigate = np.asarray(wbc_goal.DEFAULT_NAV_CMD, dtype=np.float64)
     n = len(waypoints)
     stats.goto_accepted += 1
+    _reset_ik_hold(ctx)
     hands = None if req.hands is None else (req.hands[0], req.hands[1])
     _publish_trajectory(ctx, waypoints, [base_height] * n, [navigate] * n, None, hands)
     print(f"[adapter] goto: {n} waypoints over {n * dt:.2f}s at {speed:.2f} rad/s "

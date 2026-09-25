@@ -469,6 +469,20 @@ class UpperBodyIK:
     def width(self) -> int:
         return 17 if self.include_waist else 14
 
+    def reset_hold(self) -> None:
+        """Forget the hold-on-reject fallback (`_last_good`).
+
+        `_last_good` is only ever written by pose-lane solves and was never
+        cleared, so after a joint-lane phase (goto plus joint chunks, e.g.
+        a move to a stage's start pose) the first pose-lane reject would
+        have commanded the LAST pose-lane solution from before that phase
+        -- possibly another stage's pose, bounded only by the step clamp.
+        The driver calls this whenever it accepts a joint-lane message, so
+        the next reject falls back to the measured arms, as on a fresh
+        start.
+        """
+        self._last_good = None
+
     def solve_row(self, row25: np.ndarray, body_q29: np.ndarray) -> IKResult:
         row = np.asarray(row25, dtype=np.float64).reshape(-1)
         q_left = self.left.solve(body_q29, row[4:7], row[7:11])
