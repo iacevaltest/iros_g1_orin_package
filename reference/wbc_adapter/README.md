@@ -156,7 +156,7 @@ python3 wbc_driver.py --lane sonic --live \
 ```
 
 `--enable-waist` **must** match how `run_g1_control_loop.py` was launched:
-waist in the upper-body group means width 17, otherwise 14. Get it wrong
+waist in the upper-body group means width 31, otherwise 28 (7+7 arm joints plus 7+7 hand-model slots; `--no-with-hands` does not shrink it). Get it wrong
 and every joint in the vector is misaligned. Read it from the robot model
 rather than trusting the flag where you can.
 

@@ -68,7 +68,7 @@ def build_goal(
 
     `upper_body_waypoints` is either a single (N,) joint vector or a (T, N)
     trajectory, where N is the WBC's own upper-body joint-group width (14
-    without waist, 17 with -- depends on how the control loop was launched;
+    without waist, 31 with -- depends on how the control loop was launched (28 = 7+7 arm joints plus 7+7 hand-model slots);
     never hardcode it, read it from the robot model. See ik.py).
 
     --------------------------------------------------------------------
@@ -90,7 +90,7 @@ def build_goal(
 
     Per-key widths, from the policy's own `init_values`
     (`wbc_policy_factory.py`): `base_height_command` is **1**,
-    `navigate_cmd` is **3**, `target_upper_body_pose` is 14 or 17. Each
+    `navigate_cmd` is **3**, `target_upper_body_pose` is 28 or 31. Each
     key must end up as a (T, D) array after `np.array(...)`, so scalars
     have to be wrapped per waypoint -- `[[h], [h], ...]`, not `[h, h, ...]`
     (the latter becomes (T,) and gets mis-tiled to (T, T)).
