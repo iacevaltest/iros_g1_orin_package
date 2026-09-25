@@ -165,8 +165,8 @@ PUBLISH_STEREO = os.environ.get("PUBLISH_STEREO", "1") != "0"
 # the reference training data was collected on.
 _CALIB_PATH = os.environ.get(
     "HEAD_CAMERA_CALIBRATION",
-    os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                 "config", "head_camera_calibration.yaml"))
+    os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+                 "config", "head_camera_calibration.yaml"))  # repo-root config/, three levels up
 
 
 def _load_calibration(path):
