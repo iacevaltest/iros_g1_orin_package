@@ -160,12 +160,17 @@ sub-centiradian trims. A
 policy that is clamped often is a policy commanding outside the robot's
 range — that is visible in your own published rows, and it is yours.
 
-**First goal after connecting.** The controller holds its own start-up
-pose (`shoulder_roll` ±0.2 rad, everything else 0) rather than the measured
-pose, so the first trajectory it receives may step up to ~0.1 rad in one
-tick regardless of what you publish. A `goto` first, or the step clamp on
-your first chunk, bounds that step. (Controller start-up pose; tracked
-separately from this contract.)
+**First goal after connecting.** When the controller is launched through
+the organizer wrapper (`tools/run_wbc_with_dex1.py`, its default
+`--seed-from-measured`) this step no longer occurs: the controller's
+interpolator is seeded with the measured pose at launch, so it already holds
+where the arms are and the first trajectory continues from there. On a
+stock launch (`--no-seed-from-measured`, or NVIDIA's entrypoint directly)
+the controller holds its own start-up pose (`shoulder_roll` ±0.2 rad,
+everything else 0) rather than the measured pose, so the first trajectory
+it receives may step up to ~0.1 rad in one tick regardless of what you
+publish; there, a `goto` first, or the step clamp on your first chunk,
+bounds that step.
 
 ### `goto` — move to a start pose
 

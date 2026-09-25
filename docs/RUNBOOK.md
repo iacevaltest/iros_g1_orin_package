@@ -182,14 +182,23 @@ interpolator at `--upper-body-joint-speed 3.0` rad/s (stock default is
 dead and the interpolator uncapped. `--interface` defaults to `sim` — set
 the real network interface explicitly here, or nothing reaches the motors.
 
-**The controller moves the arms when it starts.** Its upper-body
-interpolator is seeded with a fixed rest pose (`shoulder_roll` ±0.2 rad,
-every other arm joint 0), and a 2 s ramp carries each arm joint from
-wherever it is to that pose at full stiffness, before the adapter or any
-team code is connected. Launch it with the arms clear of the table and
-anything else within reach, wait for the ramp to finish, and only then
-position the robot for a stage. (Seeding the start pose from the measured
-joints instead is an organizer change tracked separately.)
+**Start-up pose: the wrapper seeds it from the measured joints (default).**
+Stock, the controller's upper-body interpolator is seeded with a fixed rest
+pose (`shoulder_roll` ±0.2 rad, every other arm joint 0) and a 2 s ramp
+carries each arm joint from wherever it is to that pose at full stiffness,
+before the adapter or any team code is connected — i.e. the arms swing at
+launch. `run_wbc_with_dex1.py` now waits for the first valid `rt/lowstate`
+and seeds the interpolator with the MEASURED joint angles instead
+(`--seed-from-measured`, on by default; it logs one `[seed] ... 14 arm
+joints = ...` line with the values it used). What to expect: no arm motion
+at launch — the command starts at the measured pose, so the 2 s ramp is a
+no-op and the arms simply stiffen where they are. `--enable-waist` is
+covered too (the waist gets its measured values). If no valid state arrives
+within 5 s the wrapper prints a `[seed] WARNING` and falls back to stock,
+so if you see that warning, expect the swing. `--no-seed-from-measured`
+restores the stock behaviour outright; with it (or with the stock
+entrypoint) launch with the arms clear of the table and anything else
+within reach and wait for the ramp to finish before positioning the robot.
 
 The controller must reach a stable idle/hold state (confirmable via
 `ros2 topic hz /G1Env/env_state_act`) before Step 3 starts.
@@ -407,6 +416,8 @@ Generated from the source of each script. Run any of them with
 | `--dex1-max-speed` | `2.0` | rad/s of raw Dex1 motor q; full stroke is ~5.3 |
 | `--dex1-verbose` | `flag` |  |
 | `--no-dex1` | `flag` | run completely stock, no gripper injection |
+| `--seed-from-measured` | `on` | at launch, seed the WBC's upper-body interpolator with the MEASURED joint angles so the arms hold where they are instead of swinging to the model's rest pose over 2 s. Falls back to stock with a `[seed] WARNING` if no valid state arrives within 5 s. |
+| `--no-seed-from-measured` | `flag` | stock start-up: the interpolator is seeded with the model rest pose (`shoulder_roll` ±0.2, else 0) and the arms ramp to it over 2 s at full kp. |
 
 ### `reference/wbc_adapter/wbc_driver.py`
 
