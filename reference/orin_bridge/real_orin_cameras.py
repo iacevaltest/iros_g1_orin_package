@@ -29,6 +29,7 @@ HEAD_ALLOW_RESIZE_FALLBACK=1 is set explicitly (diagnostics only).
 """
 from __future__ import annotations
 
+import ast
 import os
 import sys
 import threading
@@ -133,60 +134,101 @@ def probe_frame_is_head_camera(frame: np.ndarray, expected_width: int = DATASET_
     return frame is not None and frame.ndim >= 2 and frame.shape[1] == expected_width
 
 
-# Stereo calibration for THIS physical head camera (confirmed same unit used for the
-# original 512-episode data collection). Values as given, not recomputed --
-# R1/R2/P1/P2 are the calibration's own rectification outputs, used as-is so the
-# rectified image matches whatever was actually used at data-collection time.
-_CAM_MATRIX_LEFT = np.array([
-    [337.5311318539417, 0.0, 316.5285046932812],
-    [0.0, 336.61378142923456, 232.50620475777816],
-    [0.0, 0.0, 1.0],
-])
-_CAM_MATRIX_RIGHT = np.array([
-    [336.30012498108425, 0.0, 321.60051380995424],
-    [0.0, 335.47329565297144, 231.69425545320323],
-    [0.0, 0.0, 1.0],
-])
-_DIST_LEFT = np.array([0.06635329597971165, -0.07841619072258442,
-                        -0.0032837567734969727, -0.0010816865229956933, 0.021030073866954904])
-_DIST_RIGHT = np.array([0.06366431884731834, -0.08229830690155956,
-                         -0.0031845859537499963, 0.0017675102141209843, 0.027381390668112876])
-_R1 = np.array([
-    [0.9992450760979893, -0.006580452854965362, 0.03828805994232576],
-    [0.006547478029861057, 0.9999780783764134, 0.0009865586977590912],
-    [-0.038293712608887094, -0.0007351236897390344, 0.9992662563940548],
-])
-_R2 = np.array([
-    [0.9970325836991178, -0.0070000624646499926, 0.07666176470544075],
-    [0.007066114951150908, 0.9999748604134095, -0.0005903902768392253],
-    [-0.07665570469155238, 0.001130339184874579, 0.997056981958187],
-])
-_P1 = np.array([
-    [362.7751607273391, 0.0, 282.4990463256836, 0.0],
-    [0.0, 362.7751607273391, 229.0226879119873, 0.0],
-    [0.0, 0.0, 1.0, 0.0],
-])
-_P2 = np.array([
-    [362.7751607273391, 0.0, 282.4990463256836, -21875.510224633603],
-    [0.0, 362.7751607273391, 229.0226879119873, 0.0],
-    [0.0, 0.0, 1.0, 0.0],
-])
-# The rectify maps are built for a 640x480 eye -- the intrinsics above are
-# 640x480 intrinsics (cx ~316, cy ~232). They are therefore only geometrically
-# valid in the native 1280x480 mode, where each raw half already is 640x480.
-# Remapping a resized (squashed) eye with them would be silently wrong.
+# Stereo calibration for the head camera, read from config/ at startup.
+# PER-RIG DATA -- see config/head_camera_calibration.yaml. Edit that file (or
+# point HEAD_CAMERA_CALIBRATION at another one) and restart this script; no
+# calibration value is hardcoded here. R1/R2/P1/P2 are the calibration's own
+# rectification outputs, used as-is rather than recomputed. Only applied to
+# frames when EGO_VIEW_RECTIFY=1.
+#
+# The rectify maps are built for a 640x480 eye -- the calibration must be a
+# 640x480 calibration (rectify_size: [640, 480]). It is therefore only
+# geometrically valid in the native 1280x480 mode, where each raw half already
+# is 640x480. Remapping a resized (squashed) eye with it would be silently wrong.
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+_CALIB_PATH = os.environ.get(
+    "HEAD_CAMERA_CALIBRATION",
+    os.path.join(_REPO_ROOT, "config", "head_camera_calibration.yaml"))
 _RECTIFY_SIZE = (FRAME_SHAPE[1], FRAME_SHAPE[0])  # (w, h) = (640, 480)
 
-_map1_left, _map2_left = cv2.initUndistortRectifyMap(
-    _CAM_MATRIX_LEFT, _DIST_LEFT, _R1, _P1, _RECTIFY_SIZE, cv2.CV_16SC2
-)
-_map1_right, _map2_right = cv2.initUndistortRectifyMap(
-    _CAM_MATRIX_RIGHT, _DIST_RIGHT, _R2, _P2, _RECTIFY_SIZE, cv2.CV_16SC2
-)
-RECTIFY_MAPS = {
-    "left": (_map1_left, _map2_left),
-    "right": (_map1_right, _map2_right),
+# key -> required array shape (None: a flat OpenCV distortion vector)
+_CALIB_KEYS = {
+    "cam_matrix_left": (3, 3), "cam_matrix_right": (3, 3),
+    "dist_left": None, "dist_right": None,
+    "r1": (3, 3), "r2": (3, 3),
+    "p1": (3, 4), "p2": (3, 4),
 }
+
+
+def _load_calibration(path):
+    """Minimal loader -- avoids a PyYAML dependency in the camera env. Same
+    one-key-per-line format as config/head_camera_calibration.yaml."""
+    out = {}
+    with open(path) as fh:
+        for line in fh:
+            line = line.split("#", 1)[0].strip()
+            if not line or ":" not in line:
+                continue
+            key, _, rest = line.partition(":")
+            out[key.strip()] = ast.literal_eval(rest.strip())
+    return out
+
+
+def load_head_calibration(path):
+    """Load and validate the calibration file and print what was loaded.
+    Returns {key: np.ndarray} for every key in _CALIB_KEYS."""
+    calib = _load_calibration(path)
+    arrays = {}
+    for key, shape in _CALIB_KEYS.items():
+        if key not in calib:
+            raise ValueError(f"{path}: missing key {key!r}")
+        arr = np.array(calib[key], dtype=np.float64)
+        if shape is not None and arr.shape != shape:
+            raise ValueError(f"{path}: {key} has shape {arr.shape}, expected {shape}")
+        if shape is None and (arr.ndim != 1 or arr.size not in (4, 5, 8, 12, 14)):
+            raise ValueError(f"{path}: {key} must be a flat list of 4/5/8/12/14 coefficients")
+        arrays[key] = arr
+    size = tuple(calib.get("rectify_size", ()))
+    if size != _RECTIFY_SIZE:
+        # Intrinsics are only valid at the resolution they were measured at.
+        raise ValueError(f"{path}: rectify_size {list(size)} does not match the published "
+                         f"eye size {list(_RECTIFY_SIZE)} (w, h)")
+
+    kl, kr, p2 = arrays["cam_matrix_left"], arrays["cam_matrix_right"], arrays["p2"]
+    print(f"{_TAG} head calibration loaded from {path}: "
+          f"L fx={kl[0, 0]:.3f} fy={kl[1, 1]:.3f} cx={kl[0, 2]:.3f} cy={kl[1, 2]:.3f} | "
+          f"R fx={kr[0, 0]:.3f} fy={kr[1, 1]:.3f} cx={kr[0, 2]:.3f} cy={kr[1, 2]:.3f} | "
+          f"baseline={-p2[0, 3] / p2[0, 0]:.2f} (calibration units)", flush=True)
+    return arrays
+
+
+try:
+    _CALIB = load_head_calibration(_CALIB_PATH)
+except (OSError, ValueError, SyntaxError) as exc:
+    if EGO_VIEW_RECTIFY:
+        # Rectifying with a missing or malformed calibration would publish
+        # wrong images; refuse to start instead.
+        sys.exit(f"{_TAG} ERROR: EGO_VIEW_RECTIFY=1 but the head calibration could not be "
+                 f"loaded: {exc}")
+    print(f"{_TAG} WARNING: head calibration not loaded ({exc}). Rectification is off, so "
+          f"published frames are unaffected, but fix this before setting EGO_VIEW_RECTIFY=1",
+          file=sys.stderr, flush=True)
+    _CALIB = None
+
+if _CALIB is not None:
+    _CAM_MATRIX_LEFT = _CALIB["cam_matrix_left"]
+    _CAM_MATRIX_RIGHT = _CALIB["cam_matrix_right"]
+    RECTIFY_MAPS = {
+        "left": cv2.initUndistortRectifyMap(
+            _CAM_MATRIX_LEFT, _CALIB["dist_left"], _CALIB["r1"], _CALIB["p1"],
+            _RECTIFY_SIZE, cv2.CV_16SC2),
+        "right": cv2.initUndistortRectifyMap(
+            _CAM_MATRIX_RIGHT, _CALIB["dist_right"], _CALIB["r2"], _CALIB["p2"],
+            _RECTIFY_SIZE, cv2.CV_16SC2),
+    }
+else:
+    _CAM_MATRIX_LEFT = _CAM_MATRIX_RIGHT = None
+    RECTIFY_MAPS = {"left": None, "right": None}
 
 _latest_lock = threading.Lock()
 _latest_frames: dict[str, np.ndarray] = {}   # key -> BGR uint8 (480,640,3)
