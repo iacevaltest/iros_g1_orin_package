@@ -148,7 +148,7 @@ waypoint is due, it holds that final pose. Same on both lanes.
 | Clamp | Source | Setting |
 |---|---|---|
 | position | the **raw URDF limits** of `g1_29dof_with_hand.urdf` — the model file both the controller and the organizer's IK load — read off the loaded model, never typed in; a 1e-3 rad margin keeps commands off the exact edge. Left `shoulder_roll` is `[-1.588, 2.252]`, right is the mirror `[-2.252, 1.588]`, elbow `[-1.047, 2.094]`, wrist_roll `±1.972`. The controller's own model additionally narrows `shoulder_roll` to 0.19 rad from the torso, but nothing on the robot enforces that (its safety monitor treats position violations as warnings only) and the `decoupled` lane's IK ranges over the raw URDF too, so the joint lane does the same. | `--joint-lane-limits urdf` (default) |
-| position, IK-parity | the same raw URDF limits plus the two overrides the organizer's IK solver applies to itself (`elbow ≤ 1.4`, `wrist_roll` within `±0.9`) — exactly what the `decoupled` lane's solver enforces. Those exist to steer a redundant IK solution, not to protect hardware, so they are **not** applied to joint-space policies unless ruled. | `--joint-lane-limits ik` |
+| position, IK-parity | the same raw URDF limits plus the position overrides the organizer's IK solver applies to itself — exactly what the `decoupled` lane's solver enforces. With the defaults that is `elbow ≤ 1.4` only: `wrist_roll` is **no longer hard-limited on either lane** (the former `±0.9` cap is off; a posture weight steers the IK toward the measured pose instead, and the raw URDF `±1.972` is the bound), so `ik` differs from `urdf` only by the elbow bound. Those overrides exist to steer a redundant IK solution, not to protect hardware, so they are **not** applied to joint-space policies unless ruled. | `--joint-lane-limits ik` |
 | step | `--max-joint-vel` (1.0 rad/s) at `--chunk-hz` (20 Hz): 0.05 rad per row | as `decoupled` |
 
 Every clamp larger than 0.01 rad is counted in the adapter's `[stats]`
@@ -160,12 +160,17 @@ sub-centiradian trims. A
 policy that is clamped often is a policy commanding outside the robot's
 range — that is visible in your own published rows, and it is yours.
 
-**First goal after connecting.** The controller holds its own start-up
-pose (`shoulder_roll` ±0.2 rad, everything else 0) rather than the measured
-pose, so the first trajectory it receives may step up to ~0.1 rad in one
-tick regardless of what you publish. A `goto` first, or the step clamp on
-your first chunk, bounds that step. (Controller start-up pose; tracked
-separately from this contract.)
+**First goal after connecting.** When the controller is launched through
+the organizer wrapper (`tools/run_wbc_with_dex1.py`, its default
+`--seed-from-measured`) this step no longer occurs: the controller's
+interpolator is seeded with the measured pose at launch, so it already holds
+where the arms are and the first trajectory continues from there. On a
+stock launch (`--no-seed-from-measured`, or NVIDIA's entrypoint directly)
+the controller holds its own start-up pose (`shoulder_roll` ±0.2 rad,
+everything else 0) rather than the measured pose, so the first trajectory
+it receives may step up to ~0.1 rad in one tick regardless of what you
+publish; there, a `goto` first, or the step clamp on your first chunk,
+bounds that step.
 
 ### `goto` — move to a start pose
 

@@ -464,23 +464,226 @@ class JointPositionClamp(unittest.TestCase):
         self.assertLess(0.0025, wbc_driver.CLAMP_REPORT_THRESHOLD_RAD)
 
     def test_ik_mode_applies_the_solver_overrides(self):
+        """With the default IKSettings, `ik` mode differs from `urdf` by the
+        elbow bound only: wrist_roll_limit_override is None (a posture
+        weight steers the IK instead), so wrist_roll keeps the raw URDF
+        +-1.9722 on both lanes. An explicit float restores the old cap."""
         s = solver().settings
+        self.assertIsNone(s.wrist_roll_limit_override)
         urdf = wbc_driver._load_arm_limits("urdf", mapper(), s)
         ikm = wbc_driver._load_arm_limits("ik", mapper(), s)
         for off in (0, 7):
             self.assertEqual(ikm.upper[off + 3], s.elbow_upper_limit_override)
-            self.assertEqual(ikm.upper[off + 4], s.wrist_roll_limit_override)
-            self.assertEqual(ikm.lower[off + 4], -s.wrist_roll_limit_override)
+            self.assertEqual(ikm.upper[off + 3], 1.4)
             self.assertGreater(urdf.upper[off + 3], ikm.upper[off + 3])
+            self.assertEqual(ikm.upper[off + 4], urdf.upper[off + 4])
+            self.assertEqual(ikm.lower[off + 4], urdf.lower[off + 4])
+            np.testing.assert_allclose([ikm.lower[off + 4], ikm.upper[off + 4]],
+                                       [-1.9722, 1.9722], atol=1e-4)
+        # every other joint is identical between the two modes
+        diff = np.flatnonzero((ikm.upper != urdf.upper) | (ikm.lower != urdf.lower))
+        self.assertEqual(list(diff), [3, 10])
         ctx = make_ctx(limits="ik", max_joint_vel=0)
         rows = joint_rows(T=1)
         rows[0, 7] = 1.9      # left elbow: inside the URDF, outside the IK override
-        rows[0, 8] = 1.5      # left wrist_roll: same
+        rows[0, 8] = 1.5      # left wrist_roll: inside the URDF, over the OLD 0.9 cap
         with contextlib.redirect_stderr(io.StringIO()):
             wbc_driver._handle_joint(ctx, joint_msg(rows))
         wp = ctx.backend.goals[0]["target_upper_body_pose"][0]
         self.assertAlmostEqual(wp[3], s.elbow_upper_limit_override - ikm.MARGIN, places=12)
-        self.assertAlmostEqual(wp[4], s.wrist_roll_limit_override - ikm.MARGIN, places=12)
+        self.assertAlmostEqual(wp[4], 1.5, places=6)     # passes through untouched
+        self.assertEqual(ctx.stats.joints_clamped, 1)
+
+    def test_ik_mode_with_an_explicit_wrist_roll_override(self):
+        s = ik.IKSettings(wrist_roll_limit_override=0.9)
+        ikm = wbc_driver._load_arm_limits("ik", mapper(), s)
+        urdf = wbc_driver._load_arm_limits("urdf", mapper(), s)
+        for off in (0, 7):
+            self.assertEqual(ikm.upper[off + 3], 1.4)
+            self.assertEqual(ikm.upper[off + 4], 0.9)
+            self.assertEqual(ikm.lower[off + 4], -0.9)
+        # the override never touches `urdf` mode
+        np.testing.assert_allclose([urdf.lower[4], urdf.upper[4]], [-1.9722, 1.9722], atol=1e-4)
+        self.assertIn("ik.py solver overrides", ikm.source)
+        self.assertEqual(ikm.clamp(np.r_[LEFT_ARM[:4], 1.5, LEFT_ARM[5:], RIGHT_ARM])[0][4],
+                         0.9 - ikm.MARGIN)
+
+
+class WristRollPostureWeight(unittest.TestCase):
+    """2026-09-23: `IKSettings.wrist_roll_limit_override` defaults to None.
+    The old 0.9 rad value was written into the solver model's position
+    limits, i.e. a hard QP constraint that made every pose needing more
+    wrist roll infeasible; `wrist_roll_posture_weight` (4.0) now steers the
+    redundant DOF toward the measured seed instead of forbidding it.
+
+    The targets are FK of a joint configuration with wrist_roll = 1.3 rad
+    on both arms (beyond the old cap, inside the URDF's 1.9722) on the same
+    model the other tests use. The seed is the MEASURED pose the driver
+    hands the solver every call. With the seed already past 0.9 -- what the
+    robot reports once it has tracked there -- the old cap projects the
+    seed back to 0.9 and the constraint keeps the solution there; the new
+    default must track the intended roll. From a seed far below the cap
+    (the fixed test pose, wrist_roll 0.10) the 7-DOF arm can reach the same
+    6-DOF pose with much less wrist roll, so only acceptance is asserted
+    there and the solved value is reported."""
+
+    WR = 1.3
+    TOL = 0.3
+
+    @staticmethod
+    def _fresh(**over) -> ik.UpperBodyIK:
+        urdf, assets = _ik_urdf()
+        return ik.UpperBodyIK(ik.IKSettings(max_err=1e-3, **over), include_waist=False,
+                              urdf=urdf, assets=assets, warm_start="current")
+
+    @staticmethod
+    def _seed(wrist_roll):
+        q29 = wbc_driver._q29(Q43)
+        q29[19] = wrist_roll      # left_wrist_roll
+        q29[26] = wrist_roll      # right_wrist_roll
+        return q29
+
+    @classmethod
+    def _row(cls, s, wrist_roll):
+        q = cls._seed(wrist_roll)
+        lp, lq = _wrist_pose_in_pelvis(s.left, q)
+        rp, rq = _wrist_pose_in_pelvis(s.right, q)
+        row = np.zeros(25)
+        row[4:7], row[7:11], row[11:14], row[14:18] = lp, lq, rp, rq
+        return row
+
+    def test_default_has_no_hard_wrist_roll_limit(self):
+        s = self._fresh()
+        self.assertIsNone(s.settings.wrist_roll_limit_override)
+        self.assertEqual(s.settings.wrist_roll_posture_weight, 4.0)
+        for arm in (s.left, s.right):
+            j = arm.q_index[f"{arm.side}_wrist_roll_joint"]
+            np.testing.assert_allclose([arm.model.lowerPositionLimit[j], arm.model.upperPositionLimit[j]],
+                                       [-1.9722, 1.9722], atol=1e-4)
+            e = arm.q_index[f"{arm.side}_elbow_joint"]
+            self.assertEqual(arm.model.upperPositionLimit[e], 1.4)      # elbow override unchanged
+
+    def test_default_accepts_and_tracks_wrist_roll_beyond_the_old_cap(self):
+        s = self._fresh()
+        row = self._row(s, self.WR)
+        res = s.solve_row(row, self._seed(1.25))
+        self.assertTrue(res.left_ok and res.right_ok, (res.left_err, res.right_err))
+        got = (res.upper_body[4], res.upper_body[11])
+        print(f"\n[wrist_roll posture weight] seed 1.25 -> target {self.WR}: "
+              f"solved L={got[0]:+.3f} R={got[1]:+.3f}")
+        for v in got:
+            self.assertGreater(v, 0.9)                     # past the old cap
+            self.assertLess(abs(v - self.WR), self.TOL)
+
+    def test_default_accepts_from_a_far_seed_and_reports_the_solved_roll(self):
+        s = self._fresh()
+        row = self._row(s, self.WR)
+        res = s.solve_row(row, wbc_driver._q29(Q43))       # measured wrist_roll 0.10 / -0.10
+        self.assertTrue(res.left_ok and res.right_ok, (res.left_err, res.right_err))
+        got = (res.upper_body[4], res.upper_body[11])
+        print(f"\n[wrist_roll posture weight] seed 0.10 -> target {self.WR}: "
+              f"solved L={got[0]:+.3f} R={got[1]:+.3f} (redundant DOF; accept only)")
+        for v in got:
+            self.assertGreater(v, 0.10)                    # moved toward the target, not held at the seed
+
+    def test_explicit_override_restores_the_hard_cap(self):
+        s = self._fresh(wrist_roll_limit_override=0.9)
+        for arm in (s.left, s.right):
+            j = arm.q_index[f"{arm.side}_wrist_roll_joint"]
+            self.assertEqual(arm.model.upperPositionLimit[j], 0.9)
+            self.assertEqual(arm.model.lowerPositionLimit[j], -0.9)
+        row = self._row(s, self.WR)
+        res = s.solve_row(row, self._seed(1.25))
+        print(f"\n[wrist_roll hard cap 0.9] seed 1.25 -> target {self.WR}: "
+              f"L ok={res.left_ok} q={res.upper_body[4]:+.3f} R ok={res.right_ok} q={res.upper_body[11]:+.3f}")
+        # old behaviour: the solution never leaves +-0.9 -- either the arm
+        # is rejected (held at the measured 1.25) or accepted inside the cap
+        for ok, v in ((res.left_ok, res.upper_body[4]), (res.right_ok, res.upper_body[11])):
+            if ok:
+                self.assertLessEqual(abs(v), 0.9 + 1e-6)
+            else:
+                self.assertAlmostEqual(v, 1.25)             # held: measured pose passed through
+
+
+class CrossLaneHold(unittest.TestCase):
+    """The IK's hold-on-reject fallback (`UpperBodyIK._last_good`) is only
+    ever written by pose-lane solves. Without a reset, a team that runs a
+    joint-lane phase (goto plus joint chunks) and then returns to the pose
+    lane would, on its first reject, be commanded the LAST pose-lane
+    solution from before that phase. An accepted joint-lane message now
+    calls `reset_hold()`, so that reject holds the measured arms instead,
+    as on a fresh start."""
+
+    MEASURED = np.r_[LEFT_ARM, RIGHT_ARM]
+
+    @staticmethod
+    def _unreachable_rows(T=1):
+        rows = taskspace_rows(T=T)
+        rows[:, 4:7] = [3.0, 0.3, 0.0]        # 3 m out: no arm reaches it
+        rows[:, 11:14] = [3.0, -0.3, 0.0]
+        return rows
+
+    @staticmethod
+    def _arms(goal, k=0):
+        wp = np.asarray(goal["target_upper_body_pose"][k], dtype=np.float64)
+        return np.r_[wp[0:7], wp[14:21]]
+
+    def _reject(self, ctx):
+        n_left, n_right = ctx.stats.left_ok, ctx.stats.right_ok
+        with contextlib.redirect_stderr(io.StringIO()):
+            wbc_driver._handle_taskspace(ctx, taskspace_msg(self._unreachable_rows()))
+        self.assertEqual((ctx.stats.left_ok, ctx.stats.right_ok), (n_left, n_right))  # both rejected
+        return self._arms(ctx.backend.goals[-1])
+
+    def test_joint_chunk_clears_the_hold(self):
+        s = solver()
+        s.reset_hold()
+        self.assertIsNone(s._last_good)
+        ctx = make_ctx(max_joint_vel=0)          # no step clamp: the hold passes through verbatim
+        wbc_driver._handle_taskspace(ctx, taskspace_msg(taskspace_rows(T=2)))
+        self.assertIsNotNone(s._last_good)
+        held = s._last_good[:14].copy()
+        self.assertGreater(np.abs(held - self.MEASURED).max(), 0.02)
+        # pre-existing behaviour: a reject re-commands that solution
+        np.testing.assert_allclose(self._reject(ctx), held, atol=1e-9)
+        # an accepted joint chunk clears it...
+        wbc_driver._handle_joint(ctx, joint_msg(joint_rows(T=2)))
+        self.assertEqual(ctx.stats.joint_accepted, 1)
+        self.assertIsNone(s._last_good)
+        # ...so the next reject holds the MEASURED arms, not the old solution
+        np.testing.assert_allclose(self._reject(ctx), self.MEASURED, atol=1e-9)
+        # and a good solve repopulates it as before
+        wbc_driver._handle_taskspace(ctx, taskspace_msg(taskspace_rows(T=1)))
+        self.assertIsNotNone(s._last_good)
+
+    def test_goto_clears_the_hold(self):
+        s = solver()
+        ctx = make_ctx(max_joint_vel=0)
+        wbc_driver._handle_taskspace(ctx, taskspace_msg(taskspace_rows(T=2)))
+        self.assertIsNotNone(s._last_good)
+        with contextlib.redirect_stdout(io.StringIO()):
+            wbc_driver._handle_goto(ctx, goto_msg(LEFT_ARM + 0.1, RIGHT_ARM, max_speed=0.3))
+        self.assertEqual(ctx.stats.goto_accepted, 1)
+        self.assertIsNone(s._last_good)
+        np.testing.assert_allclose(self._reject(ctx), self.MEASURED, atol=1e-9)
+
+    def test_rejected_joint_messages_keep_the_hold(self):
+        s = solver()
+        ctx = make_ctx(max_joint_vel=0)
+        wbc_driver._handle_taskspace(ctx, taskspace_msg(taskspace_rows(T=1)))
+        held = s._last_good.copy()
+        with contextlib.redirect_stderr(io.StringIO()):
+            wbc_driver._handle_joint(ctx, joint_msg(joint_rows(T=2), issued_at=time.time() - 5.0))
+        self.assertEqual(ctx.stats.joint_accepted, 0)
+        np.testing.assert_array_equal(s._last_good, held)
+
+    def test_no_solver_in_bench_mode_is_fine(self):
+        ctx = make_ctx()
+        ctx.solver = None
+        wbc_driver._handle_joint(ctx, joint_msg(joint_rows(T=2)))
+        with contextlib.redirect_stdout(io.StringIO()):
+            wbc_driver._handle_goto(ctx, goto_msg(LEFT_ARM + 0.1, RIGHT_ARM, max_speed=0.3))
+        self.assertEqual((ctx.stats.joint_accepted, ctx.stats.goto_accepted), (1, 1))
 
 
 # ---------------------------------------------------------------------------

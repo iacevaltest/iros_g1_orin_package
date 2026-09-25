@@ -222,11 +222,14 @@ class ArmLimits:
     print is commented out), and the pose lane's IK ranges over the raw
     URDF; clamping to it only trimmed every echoed row of a raised arm
     (measured 0.173-0.176) and logged it. `ik` additionally applies ik.py's
-    solver-side overrides (elbow upper bound, symmetric wrist_roll cap),
-    read from IKSettings -- exactly what PinkArmIK enforces -- so both
-    lanes range over the same joint space; off by default because those
-    overrides exist to steer a redundant IK solution, not to protect
-    hardware; see docs/CONTRACT.md.
+    solver-side position overrides, read from IKSettings -- exactly what
+    PinkArmIK enforces -- so both lanes range over the same joint space.
+    With the defaults that is the elbow upper bound only: the symmetric
+    wrist_roll cap is no longer a hard limit on either lane
+    (`wrist_roll_limit_override` is None; a posture weight steers the IK
+    instead), so it is applied here only when a float is set. Off by
+    default because those overrides exist to steer a redundant IK
+    solution, not to protect hardware; see docs/CONTRACT.md.
     """
 
     MARGIN = 1e-3   # rad inside the limit, so the WBC never sees an exact edge
@@ -276,12 +279,16 @@ def _load_arm_limits(mode: str, mapper, ik_settings) -> ArmLimits:
         upper = np.asarray(model.upperPositionLimit, dtype=np.float64)[idx]
         source = f"URDF {DEFAULT_URDF.name}"
     if mode == "ik":
+        # the same overrides ik.py applies to its solver model, taken from
+        # the same settings object rather than retyped here. wrist_roll is
+        # None by default (steered by a posture weight, not hard-limited),
+        # in which case PinkArmIK leaves the URDF bound alone and so do we.
+        wc = ik_settings.wrist_roll_limit_override
         for side_offset in (0, 7):
-            # same two overrides ik.py applies to its solver model, taken
-            # from the same settings object rather than retyped here
             upper[side_offset + 3] = ik_settings.elbow_upper_limit_override
-            lower[side_offset + 4] = -ik_settings.wrist_roll_limit_override
-            upper[side_offset + 4] = ik_settings.wrist_roll_limit_override
+            if wc is not None:
+                lower[side_offset + 4] = -wc
+                upper[side_offset + 4] = wc
         source += " + ik.py solver overrides"
     return ArmLimits(names, lower, upper, source)
 
@@ -673,7 +680,9 @@ def _handle_taskspace(ctx: _DecoupledContext, msg: bytes):
             # The seed is now the real measured pose, which can sit
             # microscopically outside the limits ik.py narrows below the
             # URDF -- 2026-09-21 aborted the process on 0.904509 against
-            # a +/-0.9 wrist_roll override, 0.26 degrees over.
+            # a +/-0.9 wrist_roll override, 0.26 degrees over. (That cap
+            # is off by default since 2026-09-23; the elbow override
+            # remains and ik.py now projects the seed inside the limits.)
             stats.rejected += 1
             solve_failed = True
             print(
@@ -789,6 +798,16 @@ def _handle_joint(ctx: _DecoupledContext, msg: bytes):
               f"{type(exc).__name__}: {exc}", file=sys.stderr)
 
 
+def _reset_ik_hold(ctx: _DecoupledContext):
+    """An accepted joint-lane message moves the arms without the IK
+    seeing it, so the IK's hold-on-reject fallback (its last accepted
+    pose-lane solution) may now be a different stage's pose. Drop it: the
+    next pose-lane reject then holds the measured arms, as on a fresh
+    start. No solver in bench mode."""
+    if ctx.solver is not None:
+        ctx.solver.reset_hold()
+
+
 def _apply_joint_chunk(ctx: _DecoupledContext, chunk):
     args, stats = ctx.args, ctx.stats
     body_q = _read_body_q(ctx)
@@ -817,6 +836,7 @@ def _apply_joint_chunk(ctx: _DecoupledContext, chunk):
 
     n = len(waypoints)
     stats.joint_accepted += 1
+    _reset_ik_hold(ctx)
     goal, _ = _publish_trajectory(
         ctx, waypoints,
         [[float(r[21])] for r in rows[:n]],
@@ -924,6 +944,7 @@ def _apply_goto(ctx: _DecoupledContext, req):
     navigate = np.asarray(wbc_goal.DEFAULT_NAV_CMD, dtype=np.float64)
     n = len(waypoints)
     stats.goto_accepted += 1
+    _reset_ik_hold(ctx)
     hands = None if req.hands is None else (req.hands[0], req.hands[1])
     _publish_trajectory(ctx, waypoints, [base_height] * n, [navigate] * n, None, hands)
     print(f"[adapter] goto: {n} waypoints over {n * dt:.2f}s at {speed:.2f} rad/s "
@@ -1424,7 +1445,7 @@ def build_parser() -> argparse.ArgumentParser:
                         "b'taskspace'. The taskspace path is unaffected either "
                         "way. 'off' ignores both topics like any unknown prefix.")
     p.add_argument("--joint-lane-limits", default="urdf", choices=("urdf", "ik"),
-                   help="which position limits the joint lane clamps arm angles to (never typed in; read from the robot model file). 'urdf' (default) = the RAW URDF limits of g1_29dof_with_hand.urdf, the model both the WBC's robot model and ik.py load -- NOT the WBC RobotModel's supplemental-narrowed arrays (its 0.19 rad shoulder_roll narrowing is enforced by nothing on the robot: its JointSafetyMonitor treats position violations as warnings, and the pose lane's IK ranges over the raw URDF too). 'ik' = the same raw URDF limits plus ik.py's solver-side overrides (elbow upper bound 1.4, wrist_roll +-0.9, read from IKSettings) -- exactly what PinkArmIK enforces -- so the joint lane ranges over the same space the taskspace lane's IK does; those exist to steer a redundant solution, not to protect hardware, so they are not the default. Switch if ruled.")
+                   help="which position limits the joint lane clamps arm angles to (never typed in; read from the robot model file). 'urdf' (default) = the RAW URDF limits of g1_29dof_with_hand.urdf, the model both the WBC's robot model and ik.py load -- NOT the WBC RobotModel's supplemental-narrowed arrays (its 0.19 rad shoulder_roll narrowing is enforced by nothing on the robot: its JointSafetyMonitor treats position violations as warnings, and the pose lane's IK ranges over the raw URDF too). 'ik' = the same raw URDF limits plus ik.py's solver-side position overrides, read from IKSettings -- exactly what PinkArmIK enforces -- so the joint lane ranges over the same space the taskspace lane's IK does. With the defaults that is the elbow upper bound (1.4) only: wrist_roll is no longer hard-limited on either lane (IKSettings.wrist_roll_limit_override is None; a posture weight steers the IK toward the seed instead), so 'ik' differs from 'urdf' only by the elbow bound unless a wrist_roll override is set. Those overrides exist to steer a redundant solution, not to protect hardware, so they are not the default. Switch if ruled.")
     p.add_argument("--goto-max-speed", type=_positive_float, default=0.45,
                    help="rad/s ceiling on a b'goto' request's own max_speed; "
                         "must be > 0 (--joint-lane off is the switch, not 0). "

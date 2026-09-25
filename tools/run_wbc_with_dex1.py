@@ -44,6 +44,35 @@ Safety properties, deliberate:
   * Targets are clamped to the calibrated open/closed range.
   * kp/kd are the soft gripper gains, never the arms' stiff ones.
 
+--------------------------------------------------------------------------
+START-UP POSE (--seed-from-measured, default ON)
+--------------------------------------------------------------------------
+Stock, `get_wbc_policy` seeds the upper-body `InterpolationPolicy` with
+`robot_model.get_initial_upper_body_pose()`, which is the model's constant
+rest pose (shoulder_roll +-0.2 rad, every other arm joint 0), and
+`JointSafetyMonitor.get_safe_action` then ramps the arm command linearly
+from the first measured q to that pose over 100 steps (2 s) at full kp. So
+at every launch the arms swing to the rest pose before any client connects.
+
+`RobotModel.set_initial_body_pose(q)` exists for exactly this (NVIDIA's own
+`run_sync_sim_data_collection.py` calls it with `obs["q"]`) but the real
+control loop never does. This wrapper wraps `get_wbc_policy` as seen from
+`run_g1_control_loop`'s namespace: it waits for a valid observation from the
+`G1Env` the loop just built, copies the 43-wide measured q with the 14 hand
+slots zeroed (Dex1 has no hand state; the model default is zero anyway),
+calls `robot_model.set_initial_body_pose(q)`, then hands off to the stock
+factory with identical arguments. The interpolator therefore starts AT the
+measured pose, the 2 s ramp becomes a no-op, and the arms hold where they
+are. `--enable-waist` is covered automatically: the seeded vector is the
+full model q, so the waist joints in the upper-body group get their
+measured values too.
+
+If no valid state arrives within 5 s (observe() raising before the first
+rt/lowstate, or a 29-joint body vector that is all exactly zero, which a
+fresh process can report before the first message) it warns loudly and
+falls back to stock behaviour. `--no-seed-from-measured` restores stock
+behaviour outright.
+
 CALIBRATION (measured on one specific unit -- re-measure for your rig):
     index 31 = left, 33 = right
     q =  0.00  CLOSED
@@ -170,6 +199,105 @@ def install(port: int, max_speed: float, verbose: bool):
     return injector
 
 
+SEED_TIMEOUT_S = 5.0
+
+
+def wait_for_measured_q(env, robot_model, timeout_s: float = SEED_TIMEOUT_S,
+                        poll_s: float = 0.02):
+    """Poll env.observe() until it yields a usable model-space q, or time out.
+
+    Usable means: observe() did not raise (on the real robot the state
+    processor returns None before the first rt/lowstate and G1Body.observe
+    then raises), obs["q"] has the model's width, and the body joints (all
+    non-hand slots) are not all exactly zero. Returns a float64 copy of q
+    with the hand slots zeroed, or None on timeout.
+    """
+    hand_idx = list(robot_model.get_joint_group_indices("hands"))
+    width = int(getattr(robot_model, "num_dofs", 43))
+    body_mask = np.ones(width, dtype=bool)
+    body_mask[hand_idx] = False
+    deadline = time.monotonic() + timeout_s
+    last_reason = "observe() never returned"
+    while True:
+        try:
+            obs = env.observe()
+        except Exception as exc:              # no low state yet
+            obs, last_reason = None, f"observe() raised {type(exc).__name__}: {exc}"
+        q = None if not isinstance(obs, dict) else obs.get("q")
+        if q is not None:
+            q = np.array(q, dtype=np.float64)
+            if q.shape != (width,):
+                last_reason = f"obs['q'] has shape {q.shape}, expected ({width},)"
+            elif not np.any(q[body_mask] != 0.0):
+                last_reason = "body joints all exactly zero (no real rt/lowstate yet)"
+            else:
+                q[hand_idx] = 0.0
+                return q
+        if time.monotonic() >= deadline:
+            print(f"[seed] no valid observation within {timeout_s:.1f}s: {last_reason}",
+                  file=sys.stderr)
+            return None
+        time.sleep(poll_s)
+
+
+def install_seed_from_measured_patch(loop_mod=None, timeout_s: float = SEED_TIMEOUT_S):
+    """Make the control loop seed its upper-body interpolator from measured q.
+
+    Wraps `G1Env` and `get_wbc_policy` AS REFERENCED FROM run_g1_control_loop's
+    module namespace (both are from-imports there, so patching the source
+    modules would not reach `main`). The G1Env wrapper only records the env
+    instance the loop builds; the get_wbc_policy wrapper waits for that env's
+    first valid observation, calls `robot_model.set_initial_body_pose(q)`,
+    and then calls the stock factory with the caller's arguments forwarded
+    untouched (the stock caller passes upper_body_joint_speed as the 4th
+    POSITIONAL, which lands on the factory's `init_time`; that quirk is
+    preserved, not fixed, here).
+
+    `loop_mod` defaults to the real run_g1_control_loop module; tests pass a
+    namespace with fake `G1Env` / `get_wbc_policy` attributes. Returns a dict
+    with the captured env and the seeded q for inspection.
+    """
+    if loop_mod is None:
+        from decoupled_wbc.control.main.teleop import run_g1_control_loop as loop_mod
+
+    original_env_cls = loop_mod.G1Env
+    original_get_wbc_policy = loop_mod.get_wbc_policy
+    state = {"env": None, "seeded_q": None, "fell_back": False}
+
+    def G1Env_capturing(*args, **kwargs):
+        env = original_env_cls(*args, **kwargs)
+        state["env"] = env
+        return env
+
+    def get_wbc_policy_seeded(robot_type, robot_model, wbc_config, *args, **kwargs):
+        env = state["env"]
+        q = None
+        if env is None:
+            print("[seed] WARNING: no G1Env was constructed through the patched name; "
+                  "cannot read the measured pose", file=sys.stderr)
+        else:
+            q = wait_for_measured_q(env, robot_model, timeout_s=timeout_s)
+        if q is None:
+            state["fell_back"] = True
+            print("[seed] WARNING: falling back to STOCK start-up: the interpolator is "
+                  "seeded with the model rest pose and the arms WILL ramp to it "
+                  "(shoulder_roll +-0.2, else 0) over 2 s at full kp", file=sys.stderr)
+        else:
+            robot_model.set_initial_body_pose(q)
+            state["seeded_q"] = q
+            arm_idx = list(robot_model.get_joint_group_indices("arms"))
+            arms = " ".join(f"{v:+.3f}" for v in q[arm_idx])
+            print(f"[seed] upper-body interpolator seeded from MEASURED q; "
+                  f"14 arm joints (L sp sr sy el wr wp wy | R same) = {arms}")
+        return original_get_wbc_policy(robot_type, robot_model, wbc_config, *args, **kwargs)
+
+    loop_mod.G1Env = G1Env_capturing
+    loop_mod.get_wbc_policy = get_wbc_policy_seeded
+    print("[seed] run_g1_control_loop.get_wbc_policy wrapped: start-up pose will be the "
+          f"measured pose (waits up to {timeout_s:.0f}s for a valid state)")
+    return state
+
+
 def main():
     pre = argparse.ArgumentParser(add_help=False)
     pre.add_argument("--dex1-port", type=int, default=5599)
@@ -178,12 +306,26 @@ def main():
     pre.add_argument("--dex1-verbose", action="store_true")
     pre.add_argument("--no-dex1", action="store_true",
                      help="run completely stock, no gripper injection")
+    pre.add_argument("--seed-from-measured", action=argparse.BooleanOptionalAction,
+                     default=True,
+                     help="at launch, seed the WBC's upper-body interpolator with the "
+                          "MEASURED joint angles so the arms hold where they are instead "
+                          "of swinging to the model's rest pose over 2 s "
+                          "(--no-seed-from-measured restores stock behaviour)")
     args, passthrough = pre.parse_known_args()
 
     if not args.no_dex1:
         install(args.dex1_port, args.dex1_max_speed, args.dex1_verbose)
     else:
         print("[dex1] --no-dex1: running stock, gripper will NOT actuate")
+
+    # Independent of the Dex1 patch: seed the start-up pose from the measured
+    # joints (see START-UP POSE in the module docstring).
+    if args.seed_from_measured:
+        install_seed_from_measured_patch()
+    else:
+        print("[seed] --no-seed-from-measured: stock start-up, the arms will ramp to "
+              "the model rest pose (shoulder_roll +-0.2, else 0) over 2 s")
 
     # 2026-09-03: default NVIDIA's own preventive upper-body velocity limit
     # to something real. ControlLoopConfig.upper_body_joint_speed defaults to

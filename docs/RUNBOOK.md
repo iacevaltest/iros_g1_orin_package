@@ -182,14 +182,23 @@ interpolator at `--upper-body-joint-speed 3.0` rad/s (stock default is
 dead and the interpolator uncapped. `--interface` defaults to `sim` — set
 the real network interface explicitly here, or nothing reaches the motors.
 
-**The controller moves the arms when it starts.** Its upper-body
-interpolator is seeded with a fixed rest pose (`shoulder_roll` ±0.2 rad,
-every other arm joint 0), and a 2 s ramp carries each arm joint from
-wherever it is to that pose at full stiffness, before the adapter or any
-team code is connected. Launch it with the arms clear of the table and
-anything else within reach, wait for the ramp to finish, and only then
-position the robot for a stage. (Seeding the start pose from the measured
-joints instead is an organizer change tracked separately.)
+**Start-up pose: the wrapper seeds it from the measured joints (default).**
+Stock, the controller's upper-body interpolator is seeded with a fixed rest
+pose (`shoulder_roll` ±0.2 rad, every other arm joint 0) and a 2 s ramp
+carries each arm joint from wherever it is to that pose at full stiffness,
+before the adapter or any team code is connected — i.e. the arms swing at
+launch. `run_wbc_with_dex1.py` now waits for the first valid `rt/lowstate`
+and seeds the interpolator with the MEASURED joint angles instead
+(`--seed-from-measured`, on by default; it logs one `[seed] ... 14 arm
+joints = ...` line with the values it used). What to expect: no arm motion
+at launch — the command starts at the measured pose, so the 2 s ramp is a
+no-op and the arms simply stiffen where they are. `--enable-waist` is
+covered too (the waist gets its measured values). If no valid state arrives
+within 5 s the wrapper prints a `[seed] WARNING` and falls back to stock,
+so if you see that warning, expect the swing. `--no-seed-from-measured`
+restores the stock behaviour outright; with it (or with the stock
+entrypoint) launch with the arms clear of the table and anything else
+within reach and wait for the ramp to finish before positioning the robot.
 
 The controller must reach a stable idle/hold state (confirmable via
 `ros2 topic hz /G1Env/env_state_act`) before Step 3 starts.
@@ -407,6 +416,8 @@ Generated from the source of each script. Run any of them with
 | `--dex1-max-speed` | `2.0` | rad/s of raw Dex1 motor q; full stroke is ~5.3 |
 | `--dex1-verbose` | `flag` |  |
 | `--no-dex1` | `flag` | run completely stock, no gripper injection |
+| `--seed-from-measured` | `on` | at launch, seed the WBC's upper-body interpolator with the MEASURED joint angles so the arms hold where they are instead of swinging to the model's rest pose over 2 s. Falls back to stock with a `[seed] WARNING` if no valid state arrives within 5 s. |
+| `--no-seed-from-measured` | `flag` | stock start-up: the interpolator is seeded with the model rest pose (`shoulder_roll` ±0.2, else 0) and the arms ramp to it over 2 s at full kp. |
 
 ### `reference/wbc_adapter/wbc_driver.py`
 
@@ -433,7 +444,7 @@ Generated from the source of each script. Run any of them with
 | `--dex1-host` | `'127.0.0.1'` |  |
 | `--max-chunk-age-s` | `1.0` | drop a chunk older than this (0 disables). Guards against acting on a stale plan after a stall. |
 | `--joint-lane` | `'on'` | accept the b'joint' (T,22) joint-angle chunks and b'goto' pose requests on the same :5556 socket, alongside b'taskspace'. The taskspace path is unaffected either way. 'off' ignores both topics like any unknown prefix. |
-| `--joint-lane-limits` | `'urdf'` | which position limits the joint lane clamps arm angles to (never typed in; read from the robot model file). 'urdf' (default) = the RAW URDF limits of g1_29dof_with_hand.urdf, the model both the WBC's robot model and ik.py load -- NOT the WBC RobotModel's supplemental-narrowed arrays (its 0.19 rad shoulder_roll narrowing is enforced by nothing on the robot: its JointSafetyMonitor treats position violations as warnings, and the pose lane's IK ranges over the raw URDF too). 'ik' = the same raw URDF limits plus ik.py's solver-side overrides (elbow upper bound 1.4, wrist_roll +-0.9, read from IKSettings) -- exactly what PinkArmIK enforces -- so the joint lane ranges over the same space the taskspace lane's IK does; those exist to steer a redundant solution, not to protect hardware, so they are not the default. Switch if ruled. |
+| `--joint-lane-limits` | `'urdf'` | which position limits the joint lane clamps arm angles to (never typed in; read from the robot model file). 'urdf' (default) = the RAW URDF limits of g1_29dof_with_hand.urdf, the model both the WBC's robot model and ik.py load -- NOT the WBC RobotModel's supplemental-narrowed arrays (its 0.19 rad shoulder_roll narrowing is enforced by nothing on the robot: its JointSafetyMonitor treats position violations as warnings, and the pose lane's IK ranges over the raw URDF too). 'ik' = the same raw URDF limits plus ik.py's solver-side position overrides, read from IKSettings -- exactly what PinkArmIK enforces -- so the joint lane ranges over the same space the taskspace lane's IK does. With the defaults that is the elbow upper bound (1.4) only: wrist_roll is no longer hard-limited on either lane (IKSettings.wrist_roll_limit_override is None; a posture weight steers the IK toward the seed instead), so 'ik' differs from 'urdf' only by the elbow bound unless a wrist_roll override is set. Those overrides exist to steer a redundant solution, not to protect hardware, so they are not the default. Switch if ruled. |
 | `--goto-max-speed` | `0.45` | rad/s ceiling on a b'goto' request's own max_speed; must be > 0 (--joint-lane off is the switch, not 0). Also capped by --max-joint-vel so the step clamp never shortens the ramp. 0.45 is the speed the joint-space pre-motion that preceded this lane ran at live. |
 | `--sonic-host` | `'127.0.0.1'` |  |
 | `--sonic-port` | `5580` | gear_sonic_deploy's zmq input endpoint (--input-type zmq, NOT the default --input-type zmq_manager -- that one runs an internal planner nobody wants here). CONFIRMED 2026-09-04: g1_deploy_onnx_ref.cpp's own --zmq-port compiles in a default of 5556, same as the boundary's action port -- deploy.sh can't even pass --zmq-port through, so reaching this requires calling `just run g1_deploy_onnx_ref` directly with --zmq-port matching this flag. 5580 isn't special, just deliberately not 5555/5556/5557 (the organizer's camera/action/state ports) -- confirm whatever port gear_sonic_deploy is actually launched with matches this value exactly. |
