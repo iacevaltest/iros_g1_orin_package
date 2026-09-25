@@ -1,22 +1,28 @@
 #!/usr/bin/env python3
 """Re-derive the camera hardware ground truth on PC2 -- serials, USB ports,
 video device numbers, actual resolutions -- rather than trusting whatever
-constants happen to be hardcoded in the copy of real_orin.py on disk.
+constants happen to be hardcoded in the copy of the camera bridge on disk.
 
-Written because the copy of real_orin.py pasted into the evaluation chat
-and the copy actually running on PC2 have already been found to disagree
+Written because the copy of the bridge pasted into the evaluation chat and
+the copy actually running on PC2 have already been found to disagree
 (different WRIST_SERIALS mapping, different head-camera resolution
 assumptions) -- so nothing about this hardware should be taken on faith
 from a script's source code. This probes the hardware directly.
 
+Step 5 probes the head camera's native 1280x480 side-by-side mode -- the
+one the dataset was captured in and the only one real_orin_cameras.py will
+publish from. On 2026-08-24 a RealSense node was probed under the head
+camera's name, answered 848x480 / 640x480, and the session wrongly concluded
+that 1280x480 was not a native mode; this step tells the two cases apart.
+
 READ-ONLY except for one thing: it opens each camera briefly to negotiate
-a stream and grab ONE frame, same as real_orin.py itself does at startup.
+a stream and grab ONE frame, same as the bridge itself does at startup.
 It does not touch the robot, DDS, or any motor.
 
     python3 diagnose_cameras.py --out ~/camera_diag
 
-Run in the venv that has pyrealsense2 and opencv -- real_orin.py's own
-venv (g1_control_venv) already has both, since it needs them itself.
+Run in the venv that has pyrealsense2 and opencv -- the camera bridge's
+own env (teleimager) already has both, since it needs them itself.
 """
 from __future__ import annotations
 
@@ -26,6 +32,11 @@ import os
 import subprocess
 import sys
 import time
+
+# The head camera's native side-by-side mode -- the geometry the training
+# dataset was captured in (each half a 640x480 eye). Must agree with
+# real_orin_cameras.py's DATASET_HEAD_SIZE.
+HEAD_W, HEAD_H = 1280, 480
 
 
 def section(t):
@@ -153,8 +164,10 @@ def diagnose_v4l2(out_dir: str):
             cap.release()
             continue
         cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
-        # Ask for something absurdly large; V4L2 clamps to the actual max,
-        # which is exactly the number real_orin.py needs to agree with.
+        # Ask for something absurdly large; V4L2 clamps to the actual max.
+        # This is INFORMATIONAL: the max mode is not the mode the bridge
+        # uses. The head camera's max is 3840x1080, and running it there is
+        # exactly the mistake this tool exists to prevent (see step 5).
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, 10000)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 10000)
         w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
@@ -169,6 +182,44 @@ def diagnose_v4l2(out_dir: str):
             print(f"  {node}: opened but no frame ({w}x{h} negotiated)")
         cap.release()
         time.sleep(0.2)
+
+    section(f"5. Probe the DATASET head-camera mode ({HEAD_W}x{HEAD_H} side-by-side) on each node")
+    print("  The bridge (real_orin_cameras.py) opens the head camera at exactly this")
+    print("  mode and accepts a node only if the frame comes back exactly")
+    print(f"  {HEAD_W} wide: each half is then a 640x480 eye, no resize, which is how")
+    print("  the training dataset was captured. A RealSense node answers this")
+    print("  request with 848x480 or 640x480 -- that is the wrong node, not a")
+    print("  missing mode (the 2026-08-24 mistake).")
+    matches = []
+    for node in nodes:
+        idx = "".join(filter(str.isdigit, node))
+        cap = cv2.VideoCapture(node, cv2.CAP_V4L2)
+        if not cap.isOpened():
+            cap.release()
+            continue
+        cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, HEAD_W)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, HEAD_H)
+        ok, frame = cap.read()
+        cap.release()
+        if not ok or frame is None:
+            print(f"  {node}: no frame at {HEAD_W}x{HEAD_H}")
+        elif frame.shape[1] == HEAD_W and frame.shape[0] == HEAD_H:
+            path = os.path.join(out_dir, f"video{idx}_{HEAD_W}x{HEAD_H}.jpg")
+            cv2.imwrite(path, frame)
+            half = frame.shape[1] // 2
+            diff = float(abs(frame[:, :half].astype(int) - frame[:, half:].astype(int)).mean())
+            print(f"  {node}: {frame.shape[1]}x{frame.shape[0]}  <-- MATCHES the dataset mode; "
+                  f"left/right halves differ by mean |diff| {diff:.1f} "
+                  f"(> 0 = genuinely two eyes), saved {path}")
+            matches.append(node)
+        else:
+            print(f"  {node}: asked {HEAD_W}x{HEAD_H}, got {frame.shape[1]}x{frame.shape[0]} "
+                  f"-- NOT the head camera in its native mode (RealSense-sized = wrong node)")
+        time.sleep(0.2)
+    if not matches:
+        print(f"\n  No node produced {HEAD_W}x{HEAD_H}. The bridge will refuse to publish head")
+        print("  frames rather than resize another mode -- fix the camera before running it.")
 
 
 def main():
@@ -191,14 +242,17 @@ def main():
     print("       - which serial is physically the LEFT vs RIGHT wrist")
     print("         (cover one camera by hand, re-run, see which brightness drops")
     print("         -- same test preflight_sensors.py automates on the live stream)")
-    print("       - the head camera's real geometry: is it actually a single mono")
-    print("         image, or side-by-side stereo? At what resolution? Compare")
-    print("         against whatever real_orin.py currently assumes.")
+    print("       - the head camera: exactly one node must answer the step-5 probe")
+    print(f"         with {HEAD_W}x{HEAD_H} and visibly two eyes side by side. That is")
+    print("         the node the bridge will pick. Its max mode (step 4) is NOT")
+    print("         what the bridge uses.")
     if rs_info:
-        print(f"\n  2. Update real_orin.py's WRIST_SERIALS with the serials found in")
-        print("     step 1 above, matched to physical side by the cover test --")
-        print("     never by guessing which one 'should' be which.")
-    print("\n  3. Re-run real_orin.py, then preflight_sensors.py --require-wrists.")
+        print(f"\n  2. Set LEFT_WRIST_SERIAL / RIGHT_WRIST_SERIAL for real_orin_cameras.py")
+        print("     from the serials found in step 1 above, matched to physical side")
+        print("     by the cover test -- never by guessing which one 'should' be which.")
+    print("\n  3. Re-run real_orin_cameras.py -- expect the line")
+    print(f"     'head camera live at {HEAD_W}x{HEAD_H} (native side-by-side; each eye 640x480,")
+    print("     no resize, matches dataset)' -- then preflight_sensors.py --require-wrists.")
 
 
 if __name__ == "__main__":
