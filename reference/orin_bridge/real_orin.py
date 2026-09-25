@@ -8,6 +8,14 @@ State   :5557  -- b"g1_debug" + msgpack {body_q, base_quat}
 Read-only on the robot side (rt/lowstate subscribe only). Never publishes to
 rt/arm_sdk or anything that could move the robot -- this script only feeds
 observations upstream to the Thor policy.
+
+NOTE: the documented launch path (docs/RUNBOOK.md, Step 1) is the split pair
+real_orin_cameras.py (teleimager env) + real_orin_state.py (g1_wbc env); this
+combined script is kept for rigs where one env has both dependency sets. Its
+head-camera path is kept identical to real_orin_cameras.py -- see that file's
+docstring for the head-camera geometry (native 1280x480 side-by-side, each
+half a 640x480 eye, no resize, matching the training dataset) and for why the
+3840x1080 per-eye resize used from 2026-08-24 is gone.
 """
 from __future__ import annotations
 
@@ -43,10 +51,19 @@ except ImportError:
 # actually open+read a frame from each candidate and keeping the first one
 # that produces a real, wide frame -- same probe-and-verify pattern already
 # used below for confirming the negotiated resolution.
+_TAG = "[real_orin]"
 HEAD_DEVICE_NAME = os.environ.get("HEAD_DEVICE_NAME", "USB Camera")
 
 
 def _find_head_device() -> str | None:
+    """Resolve the head camera by V4L2 name, then confirm each candidate by
+    actually capturing one frame in the native mode.
+
+    A node is accepted only if it returns a frame EXACTLY HEAD_WIDTH wide. The
+    2026-08-24 incident probed a RealSense node under the wrong name and got
+    848x480 / 640x480 frames; a ">= 1280" test or a "whatever it gives" test
+    would have accepted such a node, this one rejects it.
+    """
     override = os.environ.get("HEAD_DEVICE")
     if override:
         return override
@@ -60,37 +77,58 @@ def _find_head_device() -> str | None:
             continue
         if HEAD_DEVICE_NAME in name:
             candidates.append(path)
+    rejected = []
     for path in candidates:
         cap = cv2.VideoCapture(path, cv2.CAP_V4L2)
         cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 3840)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, HEAD_WIDTH)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, HEAD_HEIGHT)
         ok, frame = cap.read() if cap.isOpened() else (False, None)
         cap.release()
-        if ok and frame is not None and frame.shape[1] >= 1280:
-            print(f"[real_orin] head camera resolved to {path} (name={HEAD_DEVICE_NAME!r}, "
+        if ok and frame is not None and probe_frame_is_head_camera(frame, HEAD_WIDTH):
+            print(f"{_TAG} head camera resolved to {path} (name={HEAD_DEVICE_NAME!r}, "
                   f"probe frame {frame.shape[1]}x{frame.shape[0]}) -- {len(candidates)} "
                   f"candidate node(s) shared this name", flush=True)
             return path
+        if ok and frame is not None:
+            rejected.append(f"{path}={frame.shape[1]}x{frame.shape[0]}")
     if candidates:
-        print(f"[real_orin] WARNING: found {len(candidates)} node(s) named "
-              f"{HEAD_DEVICE_NAME!r} ({candidates}) but none produced a real capture "
-              f"frame", file=sys.stderr)
+        print(f"{_TAG} WARNING: found {len(candidates)} node(s) named "
+              f"{HEAD_DEVICE_NAME!r} ({candidates}) but none produced a "
+              f"{HEAD_WIDTH}-wide capture frame"
+              + (f" (rejected: {', '.join(rejected)})" if rejected else ""),
+              file=sys.stderr)
     return None
 
 
-# 2026-08-24: HEAD_WIDTH/HEIGHT had drifted to 640x480, a mode this camera's
-# own `v4l2-ctl --list-formats-ext` does NOT list (only 3840x1080, 2160x1080,
-# 3040x1520, 3840x1520 are discrete MJPG sizes) -- V4L2 was silently
-# substituting its own nearest mode instead of the documented one. Restored
-# to 3840x1080, the exact resolution EVALUATION_PROTOCOL.md's own "ego_view
-# crop convention" section documents and freezes: left half of the 3840x1080
-# stereo frame is 1920x1080 (16:9), then resized (not cropped) to 640x480
-# (4:3). That resize is now applied per-eye below, independently, so
-# ego_view_left/ego_view_right get the same treatment as the legacy mono
-# ego_view rather than a from-scratch convention.
-HEAD_WIDTH = 3840
-HEAD_HEIGHT = 1080
+def probe_frame_is_head_camera(frame: np.ndarray, expected_width: int = 1280) -> bool:
+    """True iff a probe frame is exactly `expected_width` wide.
+
+    Rejects the RealSense-sized frames (848x480, 640x480) that the wrong node
+    produced on 2026-08-24, and anything else that is not the requested mode.
+    """
+    return frame is not None and frame.ndim >= 2 and frame.shape[1] == expected_width
+
+
+# Head camera geometry -- see real_orin_cameras.py's docstring. The head camera
+# is opened in its NATIVE 1280x480 side-by-side MJPG mode; each half IS a
+# 640x480 eye, no resize, no crop, exactly how the training dataset
+# (HF BitRobot/G1_WBT_Dex1_Building-Children-Table, 480x640x3 per cam key) was
+# captured -- verified on raw MCAP frames (77/77 head frames 1280x480, halves
+# differ by a horizontal-only disparity). The calibration intrinsics
+# (fx ~337, cx ~316, cy ~232) are those of a 640x480 eye.
+#
+# History: the native mode was used successfully on 2026-08-19/20. On
+# 2026-08-24 a wrong /dev/video node (a RealSense, 848x480 / 640x480 frames)
+# was probed, the session concluded that 1280x480 "was not a listed mode",
+# and the bridge moved to 3840x1080 with each 1920x1080 eye cv2.resize'd to
+# 640x480 -- a 16:9 -> 4:3 horizontal squash by 0.75 the dataset never had.
+# That squash is gone. Anything other than 1280x480 is refused unless
+# HEAD_ALLOW_RESIZE_FALLBACK=1 (diagnostics only).
+DATASET_HEAD_SIZE = (1280, 480)   # (w, h) side-by-side stereo frame
+HEAD_WIDTH = int(os.environ.get("HEAD_WIDTH", str(DATASET_HEAD_SIZE[0])))
+HEAD_HEIGHT = int(os.environ.get("HEAD_HEIGHT", str(DATASET_HEAD_SIZE[1])))
+HEAD_ALLOW_RESIZE_FALLBACK = os.environ.get("HEAD_ALLOW_RESIZE_FALLBACK", "0") == "1"
 # Wrist RealSense serials are PER-ROBOT. Set these for your rig; there is no
 # sensible default. Find them with: tools/diagnose_cameras.py
 WRIST_SERIALS = {
@@ -127,8 +165,8 @@ PUBLISH_STEREO = os.environ.get("PUBLISH_STEREO", "1") != "0"
 # the reference training data was collected on.
 _CALIB_PATH = os.environ.get(
     "HEAD_CAMERA_CALIBRATION",
-    os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                 "config", "head_camera_calibration.yaml"))
+    os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+                 "config", "head_camera_calibration.yaml"))  # repo-root config/, three levels up
 
 
 def _load_calibration(path):
@@ -154,6 +192,10 @@ _R2 = np.array(_CALIB["r2"])
 _P1 = np.array(_CALIB["p1"])
 _P2 = np.array(_CALIB["p2"])
 
+# The rectify maps are built for a 640x480 eye -- the intrinsics are 640x480
+# intrinsics (cx ~316, cy ~232). They are therefore only geometrically valid
+# in the native 1280x480 mode, where each raw half already is 640x480.
+# Remapping a resized (squashed) eye with them would be silently wrong.
 _RECTIFY_SIZE = (FRAME_SHAPE[1], FRAME_SHAPE[0])  # (w, h) = (640, 480)
 
 _map1_left, _map2_left = cv2.initUndistortRectifyMap(
@@ -173,20 +215,94 @@ def _set_frame(key, bgr):
         _latest_frames[key] = bgr
 
 
-def _prep_eye(raw_eye, map1, map2):
-    """Resize (not crop) to FRAME_SHAPE, then optionally rectify -- same
-    treatment as the legacy mono ego_view path, applied per-eye."""
+def split_stereo_frame(frame: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Split a side-by-side stereo frame at its middle column -- (left, right)
+    views, no copy, no resize. In the native 1280x480 mode each half is a
+    640x480 eye, exactly as the dataset's cam_left / cam_right were sliced."""
+    half_w = frame.shape[1] // 2
+    return frame[:, :half_w], frame[:, half_w:]
+
+
+def head_geometry_mismatch(actual_size, expected_size=DATASET_HEAD_SIZE):
+    """None if the negotiated (w, h) is the expected side-by-side geometry,
+    otherwise a one-line reason."""
+    aw, ah = int(actual_size[0]), int(actual_size[1])
+    ew, eh = int(expected_size[0]), int(expected_size[1])
+    if (aw, ah) == (ew, eh):
+        return None
+    return (f"negotiated {aw}x{ah}, expected {ew}x{eh}: each half would be "
+            f"{aw // 2}x{ah}, not the dataset's {ew // 2}x{eh} eye")
+
+
+def decide_head_geometry(actual_size, expected_size=DATASET_HEAD_SIZE,
+                         allow_resize_fallback=False, tag=_TAG):
+    """(mode, lines): "native" + banner / "fallback" + WARNING lines /
+    "refuse" + ERROR lines. Same logic as real_orin_cameras.py."""
+    aw, ah = int(actual_size[0]), int(actual_size[1])
+    reason = head_geometry_mismatch(actual_size, expected_size)
+    eye_w, eye_h = FRAME_SHAPE[1], FRAME_SHAPE[0]
+    if reason is None:
+        return "native", [
+            f"{tag} head camera live at {aw}x{ah} (native side-by-side; each eye "
+            f"{eye_w}x{eye_h}, no resize, matches dataset)",
+        ]
+    dataset_w, dataset_h = DATASET_HEAD_SIZE
+    ew, eh = int(expected_size[0]), int(expected_size[1])
+    body = [
+        f"head camera negotiated {aw}x{ah} (requested {ew}x{eh}) -- this stream would NOT match "
+        f"the dataset geometry.",
+        f"  The training dataset (HF BitRobot/G1_WBT_Dex1_Building-Children-Table) was captured in the",
+        f"  camera's native {dataset_w}x{dataset_h} side-by-side MJPG mode: each half IS a {eye_w}x{eye_h} eye,",
+        f"  no resize, no crop. Splitting {aw}x{ah} gives {aw // 2}x{ah} halves; resizing those to",
+        f"  {eye_w}x{eye_h} changes the aspect ratio and the field of view the policy was trained on.",
+        f"  Check the /dev/video node (HEAD_DEVICE / HEAD_DEVICE_NAME -- a RealSense node returns",
+        f"  848x480 or 640x480) and the camera's MJPG modes (v4l2-ctl --list-formats-ext).",
+    ]
+    if allow_resize_fallback:
+        lines = [f"{tag} WARNING: HEAD_ALLOW_RESIZE_FALLBACK=1 -- " + body[0]]
+        lines += [f"{tag} WARNING:{line}" for line in body[1:]]
+        lines.append(f"{tag} WARNING: publishing head frames anyway with a per-eye cv2.resize to "
+                     f"{eye_w}x{eye_h}. DIAGNOSTICS ONLY -- never for a scored run.")
+        return "fallback", lines
+    lines = [f"{tag} ERROR: " + body[0]]
+    lines += [f"{tag} ERROR:{line}" for line in body[1:]]
+    lines.append(f"{tag} ERROR: REFUSING to publish head frames -- ego_view* keys will not appear on :5555.")
+    lines.append(f"{tag} ERROR: Fix the camera mode. Set HEAD_ALLOW_RESIZE_FALLBACK=1 only to force the old "
+                 f"per-eye resize for diagnostics.")
+    return "refuse", lines
+
+
+_resize_logged = False
+
+
+def prepare_eye(raw_eye, rectify_maps=None):
+    """One raw half-frame -> published eye. In the native mode the half is
+    already 640x480 and is returned unchanged. The resize guard is kept for
+    the HEAD_ALLOW_RESIZE_FALLBACK path only and logs the first time it
+    fires. `rectify_maps` is (map1, map2) built for 640x480, or None (raw,
+    EGO_VIEW_RECTIFY=0, the dataset's own treatment)."""
+    global _resize_logged
     if raw_eye.shape[1] != FRAME_SHAPE[1] or raw_eye.shape[0] != FRAME_SHAPE[0]:
+        if not _resize_logged:
+            _resize_logged = True
+            print(f"{_TAG} WARNING: per-eye resize {raw_eye.shape[1]}x{raw_eye.shape[0]} -> "
+                  f"{FRAME_SHAPE[1]}x{FRAME_SHAPE[0]} was needed -- this stream does NOT match "
+                  f"the dataset geometry (logged once)", file=sys.stderr, flush=True)
         raw_eye = cv2.resize(raw_eye, (FRAME_SHAPE[1], FRAME_SHAPE[0]))
-    if EGO_VIEW_RECTIFY:
-        return cv2.remap(raw_eye, map1, map2, cv2.INTER_LINEAR)
+    if rectify_maps is not None:
+        return cv2.remap(raw_eye, rectify_maps[0], rectify_maps[1], cv2.INTER_LINEAR)
     return raw_eye
 
 
 def head_camera_thread():
+    if (HEAD_WIDTH, HEAD_HEIGHT) != DATASET_HEAD_SIZE:
+        print(f"{_TAG} WARNING: HEAD_WIDTH/HEAD_HEIGHT overridden to {HEAD_WIDTH}x{HEAD_HEIGHT}; the "
+              f"dataset geometry is {DATASET_HEAD_SIZE[0]}x{DATASET_HEAD_SIZE[1]} -- diagnostics only",
+              file=sys.stderr, flush=True)
+
     head_device = _find_head_device()
     if head_device is None:
-        print(f"[real_orin] WARNING: no head camera found (looked for a v4l2 device "
+        print(f"{_TAG} WARNING: no head camera found (looked for a v4l2 device "
               f"named {HEAD_DEVICE_NAME!r}) -- ego_view* keys will never publish", file=sys.stderr)
         return
 
@@ -195,40 +311,43 @@ def head_camera_thread():
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, HEAD_WIDTH)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, HEAD_HEIGHT)
     if not cap.isOpened():
-        print(f"[real_orin] WARNING: could not open head camera {head_device}", file=sys.stderr)
+        print(f"{_TAG} WARNING: could not open head camera {head_device}", file=sys.stderr)
         return
 
-    # Confirm what we actually got -- V4L2 backends sometimes silently substitute
-    # the nearest supported mode instead of erroring on an unsupported request.
+    # Confirm what we actually got -- V4L2 backends silently substitute the
+    # nearest supported mode instead of erroring on an unsupported request.
     ok, probe = cap.read()
     if not ok:
-        print("[real_orin] WARNING: head camera opened but produced no frame", file=sys.stderr)
+        print(f"{_TAG} WARNING: head camera opened but produced no frame", file=sys.stderr)
         return
     actual_h, actual_w = probe.shape[:2]
-    if (actual_w, actual_h) != (HEAD_WIDTH, HEAD_HEIGHT):
-        print(f"[real_orin] WARNING: requested {HEAD_WIDTH}x{HEAD_HEIGHT} but camera gave "
-              f"{actual_w}x{actual_h} -- eye split below assumes a side-by-side stereo "
-              f"frame and will be wrong if this mode isn't genuinely binocular", file=sys.stderr)
-    print(f"[real_orin] head camera live at {actual_w}x{actual_h}, "
-          f"eye={EGO_VIEW_EYE} rectify={EGO_VIEW_RECTIFY} stereo_publish={PUBLISH_STEREO}")
+    mode, lines = decide_head_geometry((actual_w, actual_h), (HEAD_WIDTH, HEAD_HEIGHT),
+                                       HEAD_ALLOW_RESIZE_FALLBACK)
+    for line in lines:
+        print(line, file=sys.stderr if mode != "native" else sys.stdout, flush=True)
+    if mode == "refuse":
+        cap.release()
+        return
+    print(f"{_TAG} head camera settings: eye={EGO_VIEW_EYE} rectify={EGO_VIEW_RECTIFY} "
+          f"stereo_publish={PUBLISH_STEREO}", flush=True)
+
+    maps_left = (_map1_left, _map2_left) if EGO_VIEW_RECTIFY else None
+    maps_right = (_map1_right, _map2_right) if EGO_VIEW_RECTIFY else None
+    mono_is_left = EGO_VIEW_EYE == "left"
 
     while True:
         ok, frame = cap.read()
         if not ok:
             time.sleep(0.05)
             continue
-        half_w = frame.shape[1] // 2
-        raw_left = frame[:, :half_w]
-        raw_right = frame[:, half_w:]
+        raw_left, raw_right = split_stereo_frame(frame)
+        left = prepare_eye(raw_left, maps_left)
+        right = prepare_eye(raw_right, maps_right)
 
-        mono_raw = raw_left if EGO_VIEW_EYE == "left" else raw_right
-        mono_map1, mono_map2 = (_map1_left, _map2_left) if EGO_VIEW_EYE == "left" \
-            else (_map1_right, _map2_right)
-        _set_frame("ego_view", _prep_eye(mono_raw, mono_map1, mono_map2))
-
+        _set_frame("ego_view", left if mono_is_left else right)
         if PUBLISH_STEREO:
-            _set_frame("ego_view_left", _prep_eye(raw_left, _map1_left, _map2_left))
-            _set_frame("ego_view_right", _prep_eye(raw_right, _map1_right, _map2_right))
+            _set_frame("ego_view_left", left)
+            _set_frame("ego_view_right", right)
 
 
 def wrist_camera_thread(key: str, serial: str):

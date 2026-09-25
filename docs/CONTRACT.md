@@ -225,8 +225,8 @@ Every image is `(480, 640, 3)` uint8.
 
 | Key | Required | Source |
 |---|---|---|
-| `ego_view` | **yes** | head stereo camera, one eye |
-| `ego_view_left` / `ego_view_right` | no | the two halves separately |
+| `ego_view` | **yes** | head stereo camera, left eye (the raw `640×480` left half) |
+| `ego_view_left` / `ego_view_right` | no | the raw left and right halves of the native `1280×480` side-by-side frame |
 | `left_wrist` / `right_wrist` | no | wrist depth cameras, colour stream |
 
 `ego_view` is the only guaranteed key — the bridge does not publish at all
@@ -236,14 +236,51 @@ missing key means anything sensible.
 
 ### How `ego_view` is produced
 
-The head camera delivers a `3840×1080` side-by-side stereo frame. The bridge
-takes the **left half** (`1920×1080`, 16:9) and **resizes** it to `640×480`
-(4:3). That is an aspect-ratio squash, not a crop.
+The head camera is opened in its **native `1280×480` side-by-side MJPG
+mode**. The bridge splits that frame at the middle column into two
+`640×480` halves. **Each half is the camera's full `640×480` field of view,
+unmodified**: no resize, no crop, no rectification, no colour conversion
+beyond the JPEG encode on the wire.
 
-This matters if your training data was prepared differently. The contract
-fixes the `480×640` output but says nothing about how to get there, so it is
-stated explicitly here. Rectification is **off** by default, matching the raw
-frames the reference dataset was collected on.
+- `ego_view_left` / `ego_view_right` are the raw left and right halves.
+- `ego_view` is the **left eye** (`EGO_VIEW_EYE=left`, the default).
+
+This is the geometry the reference training dataset was captured with
+(`BitRobot/G1_WBT_Dex1_Building-Children-Table`, `meta/info.json`: every
+`observation.images.cam_*` is `480×640×3` at 30 fps). It was verified on the
+raw MCAP recordings: 77/77 head frames are `1280×480`, and the two halves
+differ by a horizontal-only disparity, i.e. they are the two eyes of the same
+side-by-side frame with nothing resampled. The calibration intrinsics
+published in `config/head_camera_calibration.yaml` (`fx ≈ 337`, `cx ≈ 316`,
+`cy ≈ 232`) are those of a `640×480` eye and therefore describe this mode.
+
+Field of view per eye, derived from those intrinsics (measured on the
+organizer's unit; the yaml says they are per-unit values):
+`HFOV = 2·atan(320 / fx)` with `fx = 337.53` → **≈ 87°**;
+`VFOV = 2·atan(240 / fy)` with `fy = 336.61` → **≈ 71°**.
+
+**What changed, and what to drop.** From 2026-08-24 until this revision the
+bridge opened the camera at `3840×1080`, split it into two `1920×1080` eyes
+and `cv2.resize`d each to `640×480` — a 16:9 → 4:3 horizontal squash by
+0.75 that the dataset never had. That squash is **gone**. Any assumption
+made about it — a compensating un-squash, a `1920×1080` crop convention, a
+different horizontal field of view — should be dropped: the published eye
+is now the same image the dataset's `cam_left` / `cam_right` were sliced
+from. The `3840×1080` detour came from probing the wrong `/dev/video` node
+(a RealSense, `848×480` / `640×480` frames) and wrongly concluding that
+`1280×480` was not a native mode; the native mode had already been used
+successfully on 2026-08-19/20.
+
+The bridge enforces this. It accepts a head-camera node only if its probe
+frame is exactly `1280` wide, and if the negotiated stream is anything other
+than `1280×480` it prints a multi-line error and **refuses to publish head
+frames** rather than silently re-introducing a resize. (An operator can force
+the old per-eye resize with `HEAD_ALLOW_RESIZE_FALLBACK=1` for diagnostics;
+that path warns on every startup line and is never used for a scored run.)
+
+Rectification is **off** by default (`EGO_VIEW_RECTIFY=0`), matching the raw
+frames the dataset was collected on. The rectify maps are built for a
+`640×480` eye, so they are only geometrically valid in this native mode.
 
 ## Evaluator settings that affect your result
 

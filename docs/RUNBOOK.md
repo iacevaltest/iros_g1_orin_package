@@ -450,7 +450,9 @@ configured entirely by environment variables, so `--help` does nothing.
 | `HEAD_DEVICE` | *(unset)* | Explicit `/dev/videoN` override; skips name matching |
 | `LEFT_WRIST_SERIAL` | *(unset, required)* | RealSense serial for `left_wrist` |
 | `RIGHT_WRIST_SERIAL` | *(unset, required)* | RealSense serial for `right_wrist` |
-| `EGO_VIEW_EYE` | `left` | Which half of the stereo frame becomes `ego_view` |
+| `HEAD_WIDTH` / `HEAD_HEIGHT` | `1280` / `480` | Requested head-camera mode. The default is the camera's native side-by-side mode and the only one that matches the dataset (each half a `640×480` eye, no resize). Override for diagnostics only |
+| `HEAD_ALLOW_RESIZE_FALLBACK` | `0` | If the camera negotiates anything other than `HEAD_WIDTH×HEAD_HEIGHT` the bridge refuses to publish head frames. `1` forces the old per-eye resize instead, with a WARNING on every startup line. Diagnostics only, never for a scored run |
+| `EGO_VIEW_EYE` | `left` | Which half of the `1280×480` side-by-side frame becomes `ego_view` |
 | `EGO_VIEW_RECTIFY` | `0` | Set `1` to rectify. Off by default — reference data is unrectified |
 | `PUBLISH_STEREO` | `1` | Also publish `ego_view_left` / `ego_view_right` |
 | `HEAD_CAMERA_CALIBRATION` | `config/head_camera_calibration.yaml` | Calibration file path |
