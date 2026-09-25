@@ -61,12 +61,26 @@ does with your output once you run it:
 | Lane | Your output | What happens to it |
 |---|---|---|
 | **`decoupled`** | one `(T,25)` task-space pose chunk per message | the adapter's IK solves it into joint targets, sent to NVIDIA's Decoupled WBC over ROS2 |
+| **`joint`** | one `(T,22)` chunk of hand commands + 7+7 arm joint angles per message (plus `goto` start-pose requests) | no IK: the angles are position- and rate-clamped and sent to the same Decoupled WBC as `decoupled`, through the same `wbc_driver.py --lane decoupled` run |
 | **`sonic`** | `motion_token (T,64)` + hand joints at 50Hz | relayed byte-for-byte (no translation) into `gear_sonic_deploy`, NVIDIA's C++/TensorRT deploy binary |
 
 If you're `decoupled`: the WBC runs **no IK of its own** in its control
 loop — it just interpolates between the joint targets it's handed. All the
 IK happens upstream, in `wbc_driver.py`, using your published
 end-effector pose.
+
+**Which lane for which policy.** A policy trained on wrist poses
+(end-effector position + quaternion actions) is `decoupled`. A policy
+trained on `action.robot_q_desired`-style joint actions — the arm joint
+angles themselves — is `joint`: publish the angles you predict, in the
+`body_q` order you observed them, and nothing re-solves them. Pushing
+joint-space actions through `decoupled` (FK on your side, IK on ours)
+is not faithful: a 7-DoF arm on a 6-DoF target, with the solver's posture
+task pulling toward its seed. Both lanes run through the same
+`wbc_driver.py --lane decoupled` process and the same WBC; `joint` is on by
+default there (`--joint-lane on`) and adds `--joint-lane-limits` and
+`--goto-max-speed` (§9). The `joint` lane's contract, clamps and the `goto`
+request are in `docs/CONTRACT.md`, "The `joint` lane".
 
 ## 3 · Pre-flight — things that are YOUR responsibility to get right
 
@@ -156,14 +170,29 @@ your client would just be talking to mocks.
 ```bash
 conda activate g1_wbc
 cd ~/GR00T-WholeBodyControl
-python decoupled_wbc/control/main/teleop/run_g1_control_loop.py \
-  --keyboard_dispatcher_type ros --interface real --no-enable-onscreen \
-  --no-with-hands   # add --enable-waist here iff your policy needs a 17-wide upper-body vector
+python3 ~/wbc_adapter/deploy/run_wbc_with_dex1.py \
+  --interface eth0 --no-with-hands   # add --enable-waist here iff your policy needs the 31-wide (waist) upper-body vector
 ```
-`--interface` defaults to `sim` — set it to `real` explicitly here, or
-nothing reaches the robot's motors. This must reach a stable idle/hold
-state (confirmable via `ros2 topic hz /G1Env/env_state_act`) before Step 3
-starts.
+`run_wbc_with_dex1.py` (`tools/run_wbc_with_dex1.py` in this repo) is a
+thin wrapper around NVIDIA's `run_g1_control_loop.py`: it passes every
+flag through, adds the Dex1 gripper writes (motors 31/33) that the stock
+controller does not know about, and caps the controller's upper-body
+interpolator at `--upper-body-joint-speed 3.0` rad/s (stock default is
+1000, i.e. off). Running the stock entrypoint directly leaves the grippers
+dead and the interpolator uncapped. `--interface` defaults to `sim` — set
+the real network interface explicitly here, or nothing reaches the motors.
+
+**The controller moves the arms when it starts.** Its upper-body
+interpolator is seeded with a fixed rest pose (`shoulder_roll` ±0.2 rad,
+every other arm joint 0), and a 2 s ramp carries each arm joint from
+wherever it is to that pose at full stiffness, before the adapter or any
+team code is connected. Launch it with the arms clear of the table and
+anything else within reach, wait for the ramp to finish, and only then
+position the robot for a stage. (Seeding the start pose from the measured
+joints instead is an organizer change tracked separately.)
+
+The controller must reach a stable idle/hold state (confirmable via
+`ros2 topic hz /G1Env/env_state_act`) before Step 3 starts.
 
 ### Step 3 — the adapter, dry-run first **[PC2, Terminal C]**
 
@@ -391,7 +420,7 @@ Generated from the source of each script. Run any of them with
 | `--verbose` | `flag` |  |
 | `--wbc-backend` | `'ros2'` | ros2 = the real Decoupled WBC; zmq = bench loopback |
 | `--upper-body-from-model` | `flag` | force querying decoupled_wbc's robot model for the upper-body layout (implied by --wbc-backend ros2) |
-| `--enable-waist` | `flag` | set iff run_g1_control_loop.py runs with waist in the upper-body group (width 17 vs 14) |
+| `--enable-waist` | `flag` | set iff run_g1_control_loop.py runs with waist in the upper-body group (upper-body vector width 31 vs 28: 7+7 arm joints, 7+7 hand-model slots, plus 3 waist joints when enabled) |
 | `--chunk-hz` | `20.0` | cadence the (T,25) rows are meant to play out at |
 | `--max-waypoints` | `16` |  |
 | `--max-joint-vel` | `1.0` | rad/s cap on how fast any commanded arm joint may move between scheduled waypoints, regardless of what the raw IK solution implies. Margin under the WBC's own real-hardware joint safety monitor (+-6 rad/s, joint_safety.py) -- IK has no notion of the schedule's timing, so an unthrottled solve far from the current pose can exceed that limit and trip a hard shutdown. 0 disables. 2026-08-25: lowered from 4.0 -- across four live violations this session, ACTUAL measured joint velocity reached up to 3.0x this commanded cap (12.03 rad/s actual vs a 4.0 cap), a real gap between commanded and realized motion this adapter doesn't fully explain yet (clamp-reference staleness fixes reduced but did not eliminate it). 2026-09-03: lowered again, 2.0 -> 1.0. One team's session tripped right_elbow_joint at -7.153 (WBC's own reported figure) to -7.706 rad/s (independently recomputed from capture_evidence.py's raw body_q samples, ~20ms apart) against a 2.0 commanded cap -- ~3.6-3.9x amplification, WORSE than the 3.0x this comment already flagged as unexplained, not better. Ruled out: the already-documented unclamped path (WBC's own >1.0s teleop-timeout injecting an unclamped safe goal) -- no 'Teleop mode timeout' line anywhere near this violation in the WBC log, so this went through our own solve->clamp->publish path, not around it. target_time spacing was also checked and matches the dt this clamp assumes (times = t_base + (i+1)/chunk_hz, same chunk_hz used for max_step), so it isn't a simple units/timing mismatch either. Real body_q samples show the joint smoothly RISING for ~360ms right before the trip, then reversing hard within one ~23ms sample -- consistent with (not proven as) a position-only clamp saying nothing about the arm's existing momentum when a reversal is commanded, so tracking a same-magnitude position step in the opposite direction of travel can demand more real velocity than the step size alone implies. Since the amplification factor itself is trending worse with each measurement, not converging, 1.0 buys real margin against that uncertainty rather than assuming 3x again: even at this session's ~3.9x, worst case lands ~3.9 rad/s, clear of the 6.0 limit. The amplification mechanism is still not understood -- this is a mitigation, not a fix for the root cause. |
@@ -403,6 +432,9 @@ Generated from the source of each script. Run any of them with
 | `--dex1-port` | `5599` | where run_wbc_with_dex1.py listens for gripper targets. 0 disables (no grasp possible). |
 | `--dex1-host` | `'127.0.0.1'` |  |
 | `--max-chunk-age-s` | `1.0` | drop a chunk older than this (0 disables). Guards against acting on a stale plan after a stall. |
+| `--joint-lane` | `'on'` | accept the b'joint' (T,22) joint-angle chunks and b'goto' pose requests on the same :5556 socket, alongside b'taskspace'. The taskspace path is unaffected either way. 'off' ignores both topics like any unknown prefix. |
+| `--joint-lane-limits` | `'urdf'` | which position limits the joint lane clamps arm angles to (never typed in; read from the robot model file). 'urdf' (default) = the RAW URDF limits of g1_29dof_with_hand.urdf, the model both the WBC's robot model and ik.py load -- NOT the WBC RobotModel's supplemental-narrowed arrays (its 0.19 rad shoulder_roll narrowing is enforced by nothing on the robot: its JointSafetyMonitor treats position violations as warnings, and the pose lane's IK ranges over the raw URDF too). 'ik' = the same raw URDF limits plus ik.py's solver-side overrides (elbow upper bound 1.4, wrist_roll +-0.9, read from IKSettings) -- exactly what PinkArmIK enforces -- so the joint lane ranges over the same space the taskspace lane's IK does; those exist to steer a redundant solution, not to protect hardware, so they are not the default. Switch if ruled. |
+| `--goto-max-speed` | `0.45` | rad/s ceiling on a b'goto' request's own max_speed; must be > 0 (--joint-lane off is the switch, not 0). Also capped by --max-joint-vel so the step clamp never shortens the ramp. 0.45 is the speed the joint-space pre-motion that preceded this lane ran at live. |
 | `--sonic-host` | `'127.0.0.1'` |  |
 | `--sonic-port` | `5580` | gear_sonic_deploy's zmq input endpoint (--input-type zmq, NOT the default --input-type zmq_manager -- that one runs an internal planner nobody wants here). CONFIRMED 2026-09-04: g1_deploy_onnx_ref.cpp's own --zmq-port compiles in a default of 5556, same as the boundary's action port -- deploy.sh can't even pass --zmq-port through, so reaching this requires calling `just run g1_deploy_onnx_ref` directly with --zmq-port matching this flag. 5580 isn't special, just deliberately not 5555/5556/5557 (the organizer's camera/action/state ports) -- confirm whatever port gear_sonic_deploy is actually launched with matches this value exactly. |
 | `--sonic-socket` | `'pub'` |  |

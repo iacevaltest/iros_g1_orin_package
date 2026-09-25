@@ -22,13 +22,24 @@ Your lane is decided by your model, not by preference:
                organizer's adapter runs inverse kinematics and drives the
                Decoupled WBC.
 
+    joint      A policy trained on joint-space actions (``robot_q_desired``
+               style: the 7+7 arm angles themselves). Actions are (T, 22)
+               chunks of hands + arm angles + base commands, sent on the
+               SAME socket and consumed by the SAME adapter and WBC as
+               ``decoupled`` — no IK anywhere, the angles go to the
+               controller as published (bounded, never re-solved). Also
+               carries a ``goto`` request to move the arms to a start
+               pose at a bounded speed.
+
 Declare it in your manifest. The bench brings up a different controller for
 each, so a wrong declaration is caught before you get robot time, not during.
+(``joint`` and ``decoupled`` share a controller; the declaration still tells
+the organizer what your rows mean.)
 
 --------------------------------------------------------------------------
 Safety
 --------------------------------------------------------------------------
-Both sinks validate before publishing and raise ActionError on violation —
+All sinks validate before publishing and raise ActionError on violation —
 they never publish a malformed action. This is the last in-band check before
 29 DoF of humanoid moves. It is not a substitute for the organizer's e-stop,
 which is independent of your code and always wins.
@@ -85,6 +96,37 @@ TASKSPACE_SLICES = {
     "torso_rpy": slice(22, 25),
 }
 
+# --- Joint lane ------------------------------------------------------------
+JOINT_DIM = 22
+JOINT_TOPIC = b"joint"
+GOTO_TOPIC = b"goto"
+ARM_DOF = 7
+BODY_DOF = 29
+GOTO_MIN_SPEED = 0.01   # rad/s; the adapter refuses slower goto requests
+
+# (T, 22) row layout — fixed, do not reorder. Arm angles are radians in
+# Unitree's canonical G1JointIndex order: shoulder_pitch, shoulder_roll,
+# shoulder_yaw, elbow, wrist_roll, wrist_pitch, wrist_yaw — the same order
+# ``body_q[15:22]`` / ``body_q[22:29]`` on :5557 use, so a policy that
+# consumes body_q can publish in the frame it observed.
+#   [0:2]   left hand, 2 finger joints, -1 = open, +1 = closed
+#   [2:4]   right hand, same convention
+#   [4:11]  left arm, 7 joint angles (rad)
+#   [11:18] right arm, 7 joint angles (rad)
+#   [18:21] navigate_cmd (vx, vy, yaw_rate)
+#   [21]    base_height_cmd
+JOINT_SLICES = {
+    "left_hand": slice(0, 2),
+    "right_hand": slice(2, 4),
+    "left_arm": slice(4, 11),
+    "right_arm": slice(11, 18),
+    "navigate_cmd": slice(18, 21),
+    "base_height_cmd": slice(21, 22),
+}
+# Where the arms sit in the (29,) ``body_q`` the state stream publishes.
+BODY_Q_LEFT_ARM = slice(15, 22)
+BODY_Q_RIGHT_ARM = slice(22, 29)
+
 _DTYPE_TAG = {
     np.dtype(np.float32): "f32",
     np.dtype(np.int64): "i64",
@@ -110,7 +152,7 @@ class ActionSink(ABC):
     @staticmethod
     def for_lane(lane: str, port: int = DEFAULT_PORT, host: str = "*") -> "ActionSink":
         """Build the sink for a declared lane."""
-        sinks = {"sonic": SonicSink, "decoupled": DecoupledSink}
+        sinks = {"sonic": SonicSink, "decoupled": DecoupledSink, "joint": JointSink}
         if lane not in sinks:
             raise ActionError(
                 f"unknown lane {lane!r}; expected one of {sorted(sinks)}"
@@ -298,6 +340,207 @@ class DecoupledSink(ActionSink):
             use_bin_type=True,
         )
         self._publish(TASKSPACE_TOPIC + payload)
+
+
+# ---------------------------------------------------------------------------
+# Joint lane
+# ---------------------------------------------------------------------------
+
+
+class JointSink(ActionSink):
+    """Publishes (T, 22) joint-space chunks, plus ``goto`` start-pose requests.
+
+    Same transport and cadence model as :class:`DecoupledSink` — one whole
+    chunk per message, the adapter schedules it at its own rate — but the
+    rows carry arm joint angles instead of wrist poses, so the adapter runs
+    no IK on them. Its position clamp (robot-model limits) and step clamp
+    (``--max-joint-vel``) still apply; the controller's own safety monitor
+    and the e-stop still win.
+
+    ``send_goto`` asks the adapter to interpolate the arms from where they
+    are to a target at a bounded speed. It returns immediately; watch
+    ``body_q`` on :5557 and use :func:`arms_reached` to decide arrival. Do
+    not publish chunks while a goto is under way — a newer message
+    supersedes it (the socket is newest-wins), which is by design.
+    """
+
+    @property
+    def lane(self) -> str:
+        return "joint"
+
+    @staticmethod
+    def make_rows(
+        left_arm: np.ndarray,
+        right_arm: np.ndarray,
+        left_hand: np.ndarray,
+        right_hand: np.ndarray,
+        navigate: np.ndarray | None = None,
+        base_height: np.ndarray | None = None,
+    ) -> np.ndarray:
+        """Assemble a (T, 22) chunk from its parts.
+
+        ``left_arm``/``right_arm`` are (T, 7) radians (or (7,) for T=1).
+        ``left_hand``/``right_hand`` are (T, 2) in [-1, 1] (-1 open, +1
+        closed) and are REQUIRED: there is no "hold" value on this wire, and
+        defaulting them would silently open or close a gripper mid-task.
+        ``navigate`` (T, 3) and ``base_height`` (T,) default to zero.
+        """
+        if left_hand is None or right_hand is None:
+            raise ActionError(
+                "left_hand and right_hand are required: pass (T, 2) commands in "
+                "[-1, 1] (-1 = open, +1 = closed) for every row; there is no "
+                "default that is safe mid-task"
+            )
+        left = _rows(left_arm, ARM_DOF, "left_arm")
+        right = _rows(right_arm, ARM_DOF, "right_arm")
+        T = left.shape[0]
+        if right.shape[0] != T:
+            raise ActionError(f"left_arm has {T} rows, right_arm has {right.shape[0]}")
+        rows = np.zeros((T, JOINT_DIM), dtype=np.float32)
+        rows[:, JOINT_SLICES["left_arm"]] = left
+        rows[:, JOINT_SLICES["right_arm"]] = right
+        rows[:, JOINT_SLICES["left_hand"]] = _rows(left_hand, 2, "left_hand", T)
+        rows[:, JOINT_SLICES["right_hand"]] = _rows(right_hand, 2, "right_hand", T)
+        if navigate is not None:
+            rows[:, JOINT_SLICES["navigate_cmd"]] = _rows(navigate, 3, "navigate", T)
+        if base_height is not None:
+            rows[:, JOINT_SLICES["base_height_cmd"]] = _rows(base_height, 1, "base_height", T)
+        return rows
+
+    @staticmethod
+    def validate_chunk(actions: np.ndarray) -> np.ndarray:
+        """Check one (T, 22) chunk. Returns the coerced float32 array."""
+        arr = np.asarray(actions)
+        if arr.ndim == 1 and arr.shape[0] == JOINT_DIM:
+            arr = arr.reshape(1, JOINT_DIM)
+        if arr.ndim != 2 or arr.shape[1] != JOINT_DIM:
+            raise ActionError(
+                f"actions have shape {arr.shape}, expected (T, {JOINT_DIM})"
+            )
+        if arr.shape[0] < 1:
+            raise ActionError("action chunk is empty")
+        if arr.shape[0] > MAX_CHUNK_LENGTH:
+            raise ActionError(
+                f"chunk length T={arr.shape[0]} exceeds max {MAX_CHUNK_LENGTH}"
+            )
+        if not np.issubdtype(arr.dtype, np.floating):
+            raise ActionError(f"actions dtype {arr.dtype} is not floating")
+        arr = arr.astype(np.float32, copy=False)
+        if not np.all(np.isfinite(arr)):
+            raise ActionError("actions contain non-finite values")
+        hands = np.concatenate(
+            [arr[:, JOINT_SLICES["left_hand"]], arr[:, JOINT_SLICES["right_hand"]]],
+            axis=1,
+        )
+        if np.max(np.abs(hands)) > 1.0 + 1e-3:
+            raise ActionError(
+                f"hand commands must lie in [-1, 1] (-1 open, +1 closed); "
+                f"peak |value| = {float(np.max(np.abs(hands))):.3f}"
+            )
+        return arr
+
+    def send_chunk(self, actions: np.ndarray, issued_at: float | None = None):
+        """Validate and publish one joint-space chunk."""
+        arr = self.validate_chunk(actions)
+        self._publish(_pack_joint_chunk(arr, issued_at))
+
+    def send_goto(
+        self,
+        left_arm: np.ndarray,
+        right_arm: np.ndarray,
+        max_speed: float = 0.3,
+        hands: tuple[float, float] | None = None,
+        issued_at: float | None = None,
+    ):
+        """Ask the adapter to move the arms to (``left_arm``, ``right_arm``).
+
+        ``max_speed`` is rad/s on the fastest joint, at least 0.01; the
+        adapter caps it at its own ``--goto-max-speed`` (0.45 by default)
+        and refuses a move that would take longer than 15 s at the
+        resulting speed. ``hands`` is an optional (left, right) pair in
+        [-1, 1]; omitted means the grippers are left as they are.
+        Non-blocking.
+        """
+        self._publish(_pack_goto(left_arm, right_arm, max_speed, hands, issued_at))
+
+
+def arms_reached(
+    body_q29: np.ndarray,
+    left_arm: np.ndarray,
+    right_arm: np.ndarray,
+    tol_rad: float = 0.10,
+) -> bool:
+    """True when every arm joint in ``body_q`` (the (29,) state vector from
+    :5557) is within ``tol_rad`` of the target. Pure; pair it with
+    ``StateStream`` to wait for a ``send_goto`` to land.
+
+    The controller's PD tracking (no gravity compensation) settles loaded
+    joints 0.05-0.07 rad from the command, so a tolerance below ~0.08 may
+    never fire on a raised arm; 0.10 is the default for that reason.
+    Compare trends if you need something tighter."""
+    q = np.asarray(body_q29, dtype=np.float64).reshape(-1)
+    if q.shape[0] != BODY_DOF:
+        raise ActionError(f"body_q has {q.shape[0]} entries, expected {BODY_DOF}")
+    target = np.concatenate([
+        np.asarray(left_arm, dtype=np.float64).reshape(-1),
+        np.asarray(right_arm, dtype=np.float64).reshape(-1),
+    ])
+    if target.shape[0] != 2 * ARM_DOF:
+        raise ActionError(f"left_arm + right_arm must be 2 x {ARM_DOF} values")
+    measured = np.concatenate([q[BODY_Q_LEFT_ARM], q[BODY_Q_RIGHT_ARM]])
+    return bool(np.max(np.abs(measured - target)) <= tol_rad)
+
+
+def _rows(value, dim: int, name: str, expect_T: int | None = None) -> np.ndarray:
+    """Coerce (T, dim), (dim,) or, for dim == 1, (T,) to float32 (T, dim)."""
+    arr = np.asarray(value, dtype=np.float64)
+    if arr.ndim == 0:
+        arr = arr.reshape(1, 1)
+    if arr.ndim == 1:
+        arr = arr.reshape(-1, 1) if dim == 1 else arr.reshape(1, -1)
+    if arr.ndim != 2 or arr.shape[1] != dim:
+        raise ActionError(f"{name} has shape {arr.shape}, expected (T, {dim})")
+    if expect_T is not None and arr.shape[0] != expect_T:
+        raise ActionError(f"{name} has {arr.shape[0]} rows, expected {expect_T}")
+    if not np.all(np.isfinite(arr)):
+        raise ActionError(f"{name} contains non-finite values")
+    return arr.astype(np.float32)
+
+
+def _pack_joint_chunk(arr: np.ndarray, issued_at: float | None = None) -> bytes:
+    """The exact bytes ``JointSink.send_chunk`` publishes for a validated chunk."""
+    arr = np.ascontiguousarray(arr, dtype=np.float32)
+    payload = msgpack.packb(
+        {
+            "actions": arr.tobytes(),
+            "shape": list(arr.shape),
+            "dtype": "f32",
+            "issued_at": issued_at if issued_at is not None else time.time(),
+        },
+        use_bin_type=True,
+    )
+    return JOINT_TOPIC + payload
+
+
+def _pack_goto(left_arm, right_arm, max_speed: float, hands, issued_at: float | None) -> bytes:
+    """The exact bytes ``JointSink.send_goto`` publishes (validated here)."""
+    left = _rows(left_arm, ARM_DOF, "left_arm", 1)[0]
+    right = _rows(right_arm, ARM_DOF, "right_arm", 1)[0]
+    if not (np.isfinite(max_speed) and max_speed >= GOTO_MIN_SPEED):
+        raise ActionError(
+            f"max_speed must be a finite rad/s >= {GOTO_MIN_SPEED}, got {max_speed!r}")
+    msg = {
+        "left_arm": [float(v) for v in left],
+        "right_arm": [float(v) for v in right],
+        "max_speed": float(max_speed),
+        "issued_at": issued_at if issued_at is not None else time.time(),
+    }
+    if hands is not None:
+        h = _rows(hands, 2, "hands", 1)[0]
+        if np.max(np.abs(h)) > 1.0 + 1e-3:
+            raise ActionError("hands must lie in [-1, 1] (-1 open, +1 closed)")
+        msg["hands"] = [float(h[0]), float(h[1])]
+    return GOTO_TOPIC + msgpack.packb(msg, use_bin_type=True)
 
 
 # ---------------------------------------------------------------------------

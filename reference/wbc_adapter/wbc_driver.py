@@ -32,6 +32,17 @@ Lane handling, both verified against NVlabs/GR00T-WholeBodyControl v1.1:
              left+right_hand_joints(1,7) fields. So this lane is a RELAY,
              not a translation. We decode only to validate and report.
 
+  joint      Rides on the decoupled stack (same :5556 socket, same loop,
+             same WBC), for policies trained on joint-space actions. A
+             (T,22) chunk carries hands + 7+7 arm angles + base commands;
+             the arm angles go into `target_upper_body_pose` directly --
+             position-clamped to the robot model's limits, step-clamped
+             exactly like the IK output, mapped by UpperBodyMapper, never
+             re-solved. A `goto` request interpolates from the measured
+             arms to a target pose at a bounded speed as one goal. Off
+             with --joint-lane off. The WBC still owns rt/lowcmd; this is
+             the ONLY joint channel into it, and the e-stop overrides all.
+
 DRY-RUN BY DEFAULT. `--live` is required to actually publish anything
 robot-ward.
 
@@ -47,23 +58,42 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import struct
 import sys
 import time
 from pathlib import Path
 
+import msgpack
 import numpy as np
 import zmq
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from boundary_wire import (  # noqa: E402
-    POSE_TOPIC, TASKSPACE_TOPIC, BoundaryStateSubscriber, decode_pose,
-    decode_taskspace, validate_pose, validate_taskspace,
+    GOTO_TOPIC, JOINT_TOPIC, POSE_TOPIC, TASKSPACE_TOPIC, BoundaryStateSubscriber,
+    decode_goto, decode_joint, decode_pose, decode_taskspace, validate_goto,
+    validate_joint, validate_pose, validate_taskspace,
 )
 import wbc_goal  # noqa: E402
 
 LANES = ("decoupled", "sonic")
+
+# Joint lane bounds. A goto is ONE goal, so its length must be bounded: a
+# request that would take longer than this is refused rather than turned
+# into a trajectory of tens of thousands of waypoints (the WBC schedules
+# each one, and the keepalive would re-send them).
+GOTO_MAX_DURATION_S = 15.0
+# How far ahead a keepalive re-sends the in-flight trajectory's waypoints.
+# The WBC holds its last scheduled waypoint, so only the near future needs
+# refreshing; the whole remaining trajectory does not.
+KEEPALIVE_WINDOW_S = 2.0
+# A position clamp smaller than this is applied but neither counted nor
+# logged: a measured pose echoed back can sit a few milliradians past a
+# limit (sensor offset, the 1e-3 margin) and would otherwise be "clamped"
+# on every row; the counter is meant to report out-of-range INTENT, not
+# sub-centiradian trims.
+CLAMP_REPORT_THRESHOLD_RAD = 1e-2
 
 
 class Stats:
@@ -77,6 +107,12 @@ class Stats:
         self.published = 0
         self.gripper_sent = 0
         self.solve_ms = 0.0
+        # joint lane
+        self.joint_accepted = 0
+        self.joint_rejected = 0
+        self.goto_accepted = 0
+        self.goto_rejected = 0
+        self.joints_clamped = 0     # individual joint values pulled inside a limit
         self.t0 = time.monotonic()
 
     def report(self) -> str:
@@ -92,6 +128,12 @@ class Stats:
                      f"L={100.0 * self.left_ok / self.waypoints:.1f}% "
                      f"R={100.0 * self.right_ok / self.waypoints:.1f}%"
                      f", {self.solve_ms / self.waypoints:.1f} ms/waypoint")
+        if (self.joint_accepted or self.joint_rejected or self.goto_accepted
+                or self.goto_rejected or self.joints_clamped):
+            line += (f" | joint lane: {self.joint_accepted} chunks ok/"
+                     f"{self.joint_rejected} rejected, goto {self.goto_accepted} ok/"
+                     f"{self.goto_rejected} rejected, {self.joints_clamped} joint "
+                     f"values clamped")
         return line
 
 
@@ -163,6 +205,732 @@ def _q29(q):
     """
     q = np.asarray(q, dtype=np.float64).reshape(-1)
     return np.concatenate([q[0:22], q[29:36]]) if q.shape[0] == 43 else q[:29]
+
+
+class ArmLimits:
+    """Position limits for the 14 commanded arm joints, [left 7, right 7] in
+    Unitree G1JointIndex order -- the order the joint lane's rows, ik.py's
+    `_BODY_Q_NAMES[15:29]` and `UpperBodyMapper.build_waypoint` all share.
+
+    Read from the robot model file, never typed in. `--joint-lane-limits
+    urdf` is the RAW URDF limits of g1_29dof_with_hand.urdf -- the file
+    both the WBC's RobotModel and ik.py load -- taken off the pinocchio
+    model, NOT the RobotModel's supplemental-narrowed arrays. That model
+    narrows shoulder_roll to +-0.19 rad (g1_supplemental_info.py), but
+    nothing on the robot enforces it: JointSafetyMonitor treats position
+    violations as warnings only (joint_safety.py, critical False, and the
+    print is commented out), and the pose lane's IK ranges over the raw
+    URDF; clamping to it only trimmed every echoed row of a raised arm
+    (measured 0.173-0.176) and logged it. `ik` additionally applies ik.py's
+    solver-side overrides (elbow upper bound, symmetric wrist_roll cap),
+    read from IKSettings -- exactly what PinkArmIK enforces -- so both
+    lanes range over the same joint space; off by default because those
+    overrides exist to steer a redundant IK solution, not to protect
+    hardware; see docs/CONTRACT.md.
+    """
+
+    MARGIN = 1e-3   # rad inside the limit, so the WBC never sees an exact edge
+
+    def __init__(self, names, lower, upper, source: str):
+        self.names = list(names)
+        self.lower = np.asarray(lower, dtype=np.float64).reshape(-1)
+        self.upper = np.asarray(upper, dtype=np.float64).reshape(-1)
+        self.source = source
+        assert len(self.names) == self.lower.shape[0] == self.upper.shape[0] == 14
+
+    def clamp(self, arms14):
+        """-> (clamped copy, boolean mask of the entries that moved)."""
+        arms = np.asarray(arms14, dtype=np.float64).reshape(-1)
+        clamped = np.clip(arms, self.lower + self.MARGIN, self.upper - self.MARGIN)
+        return clamped, clamped != arms
+
+    def describe(self) -> str:
+        span = ", ".join(f"{n.replace('_joint', '')}=[{lo:+.3f},{hi:+.3f}]"
+                         for n, lo, hi in zip(self.names, self.lower, self.upper))
+        return f"{self.source}: {span}"
+
+
+def _load_arm_limits(mode: str, mapper, ik_settings) -> ArmLimits:
+    """Arm joint limits for the joint lane's position clamp -- see ArmLimits.
+
+    Always the raw URDF's numbers. With a mapper they come off the
+    pinocchio model already loaded inside the WBC's RobotModel (its
+    `pinocchio_wrapper.model`, untouched by the supplemental overrides the
+    RobotModel applies to its own limit arrays). Without one (bench
+    dry-run, no decoupled_wbc installed) the same URDF ik.py solves
+    against is read with pinocchio directly.
+    """
+    from ik import ARM_JOINTS, DEFAULT_URDF
+    names = list(ARM_JOINTS["left"]) + list(ARM_JOINTS["right"])
+    if mapper is not None:
+        model = mapper.model.pinocchio_wrapper.model
+        idx = [model.joints[model.getJointId(n)].idx_q for n in names]
+        lower = np.asarray(model.lowerPositionLimit, dtype=np.float64)[idx]
+        upper = np.asarray(model.upperPositionLimit, dtype=np.float64)[idx]
+        source = "URDF (WBC robot model's pinocchio model)"
+    else:
+        import pinocchio as pin
+        model = pin.buildModelFromUrdf(str(DEFAULT_URDF))
+        idx = [model.joints[model.getJointId(n)].idx_q for n in names]
+        lower = np.asarray(model.lowerPositionLimit, dtype=np.float64)[idx]
+        upper = np.asarray(model.upperPositionLimit, dtype=np.float64)[idx]
+        source = f"URDF {DEFAULT_URDF.name}"
+    if mode == "ik":
+        for side_offset in (0, 7):
+            # same two overrides ik.py applies to its solver model, taken
+            # from the same settings object rather than retyped here
+            upper[side_offset + 3] = ik_settings.elbow_upper_limit_override
+            lower[side_offset + 4] = -ik_settings.wrist_roll_limit_override
+            upper[side_offset + 4] = ik_settings.wrist_roll_limit_override
+        source += " + ik.py solver overrides"
+    return ArmLimits(names, lower, upper, source)
+
+
+class _DecoupledContext:
+    """State shared by the per-message handlers of `run_decoupled`.
+
+    These used to be locals of one monolithic loop. They live here so the
+    handlers (`_handle_taskspace`, `_handle_joint`, `_handle_goto`) can be
+    driven one message at a time from a test with a fake backend; the
+    control flow inside each handler is otherwise the loop's, unchanged.
+    """
+
+    # Margin under the WBC's ~1.0s watchdog -- fire before it does, not
+    # after. Checked between individual waypoint solves (see
+    # _handle_taskspace), not just between chunks, since the solve loop
+    # itself is where a slow cycle actually accumulates.
+    KEEPALIVE_DEADLINE_S = 0.7
+
+    def __init__(self, args, stats: Stats, backend, state_sub, solver, mapper,
+                 dex1_pub, arm_limits: ArmLimits | None):
+        self.args = args
+        self.stats = stats
+        self.backend = backend
+        self.state_sub = state_sub
+        self.solver = solver
+        self.mapper = mapper
+        self.dex1_pub = dex1_pub
+        self.arm_limits = arm_limits
+        # --joint-lane on/off, and, when on, why it is unusable this run
+        # (limits could not be loaded): joint/goto messages are then
+        # REJECTED and counted rather than silently ignored.
+        self.joint_lane = getattr(args, "joint_lane", "on") == "on"
+        self.joint_lane_error: str | None = None
+        self.joint_lane_error_logged = False
+        # Rate-limits the commanded arm joints against the last waypoint this
+        # adapter actually scheduled. IK has no notion of how far away in TIME
+        # its target is -- chunk_hz alone schedules the first waypoint of every
+        # chunk only 1/chunk_hz out, so a solved pose far from the current one
+        # implies whatever velocity that delta needs, with nothing capping it.
+        # Measured tripping the WBC's own real-hardware-only joint safety
+        # monitor (joint_safety.py, +-6 rad/s): first at ~7.3-7.4 rad/s on the
+        # first live goal (fixed by clamping), then again later at -6.570 rad/s
+        # on right_elbow_joint on a run where the clamp was active the whole
+        # time -- see _step_clamp's i==0 branch for why (the clamp's reference
+        # point can silently drift from the robot's real position if it's only
+        # ever updated from what THIS process last commanded). Reset every
+        # chunk to ground-truth body_q now, not just once at startup.
+        self.last_commanded_arms = None
+        # Last successfully-published waypoint + its accompanying fields, kept
+        # around purely so a keepalive (see _publish_keepalive) can hold this
+        # exact position rather than reconstructing one from parts.
+        self.last_goal_template: dict | None = None
+        self.keepalives_sent = 0
+        # 2026-09-03: wall-clock time of the last thing actually published to
+        # the WBC, by ANY path (real chunk or keepalive). See the mid-solve
+        # watchdog check in _handle_taskspace for why this exists separately
+        # from the zmq.Again-triggered keepalive -- that one only fires when
+        # the loop is BLOCKED waiting for a message; it does nothing if the
+        # loop is instead BUSY solving one. Traced a real live violation
+        # (right_elbow_joint -8.992 rad/s) to exactly that gap: the team's
+        # client published on a steady ~300ms cadence the whole time (confirmed
+        # independently via capture_evidence.py's own separate subscription,
+        # zero gaps >330ms anywhere near the violation) and the adapter's own
+        # [stats] line showed 0 keepalives for the entire run right up to the
+        # trip -- so `zmq.Again` never fired even though the WBC's own >1.0s
+        # "no fresh goal" watchdog still did, and injected the unclamped
+        # transition that caused it (confirmed: a "Teleop mode timeout" line
+        # sits directly before that violation in the WBC log). CONFLATE=1 on
+        # this socket means as long as a message is EVER waiting, `sub.recv()`
+        # returns immediately rather than timing out -- so a slow processing
+        # cycle (not a slow client) can silently eat the whole 1.0s budget with
+        # this loop technically busy the entire time, never once blocked long
+        # enough to hit the existing keepalive path.
+        self.last_publish_time = time.monotonic()
+        self.last_report = time.monotonic()
+        # The last published trajectory, every lane: waypoints with their
+        # ORIGINAL target times and per-waypoint base commands. The keepalive
+        # fires after 200ms of client silence, and the WBC's
+        # InterpolationPolicy.schedule_waypoint TRIMS everything after the
+        # garbage-collection time when a waypoint arrives earlier than its
+        # last scheduled one -- so a single-row hold at t+1/chunk_hz cut
+        # every chunk short: 0.2s at pace, then a lunge to its last waypoint
+        # within 50ms (measured 2.5-3.0 rad/s against --max-joint-vel 1.0 in
+        # sim, on both lanes). While waypoints of this trajectory are still
+        # ahead of the clock the keepalive re-sends those instead, with their
+        # original times; the plain hold is only for after the last one.
+        self.in_flight: dict | None = None
+        # Joints already reported as clamped -- the log line fires once per
+        # joint; stats.joints_clamped carries the running count.
+        self.clamp_logged: set[int] = set()
+
+
+def _publish_keepalive(ctx: _DecoupledContext) -> bool:
+    """Hold the last commanded position with a refreshed target_time.
+
+    2026-08-25: publish a keepalive rather than doing nothing. See the
+    RCVTIMEO comment in make_action_subscriber: the WBC has its own ~1.0s
+    "no fresh goal" watchdog that injects an UNCLAMPED transition of its own
+    if we go quiet too long. A short RCVTIMEO alone only helps if we
+    actually USE the extra wakeups to publish something -- this is that.
+
+    Returns False when there is nothing to hold yet (dry-run, no backend,
+    or nothing published so far), in which case the caller says so.
+    """
+    args, backend = ctx.args, ctx.backend
+    if not (args.live and backend is not None and ctx.last_goal_template is not None):
+        return False
+    tpl = ctx.last_goal_template
+    g = ctx.in_flight
+    if g is not None:
+        now = time.monotonic()
+        # The part of the trajectory still ahead of the clock, within a
+        # bounded window, with its ORIGINAL times -- re-scheduling the same
+        # (time, pose) pairs rebuilds the same trajectory in the WBC. Only
+        # strictly-future times: a waypoint at or before now would be
+        # trimmed away, or worse, become an instant target. Contiguous
+        # dt-spaced waypoints mean the first future one is at most dt away,
+        # so an empty window means the trajectory is over.
+        ahead = [i for i, t in enumerate(g["times"])
+                 if now < t <= now + KEEPALIVE_WINDOW_S]
+        if ahead:
+            keep_goal = wbc_goal.build_goal(
+                upper_body_waypoints=np.asarray([g["upper_body"][i] for i in ahead]),
+                target_time=[g["times"][i] for i in ahead],
+                base_height_command=[g["base_heights"][i] for i in ahead],
+                navigate_cmd=[g["nav_cmds"][i] for i in ahead],
+                wrist_pose=tpl["wrist_pose"],
+            )
+            backend.publish_goal(keep_goal)
+            ctx.keepalives_sent += 1
+            ctx.last_publish_time = time.monotonic()
+            return True
+        ctx.in_flight = None   # played out; fall through to the plain hold
+    keep_goal = wbc_goal.build_goal(
+        upper_body_waypoints=tpl["upper_body"],
+        target_time=[time.monotonic() + 1.0 / args.chunk_hz],
+        base_height_command=tpl["base_height"],
+        navigate_cmd=tpl["navigate_cmd"],
+        wrist_pose=tpl["wrist_pose"],
+    )
+    backend.publish_goal(keep_goal)
+    ctx.keepalives_sent += 1
+    ctx.last_publish_time = time.monotonic()
+    return True
+
+
+def _read_body_q(ctx: _DecoupledContext):
+    """The robot state this message is acted on, or None (already reported)."""
+    args = ctx.args
+    body_q = None
+    if ctx.state_sub is not None:
+        body_q = ctx.state_sub.get_body_q()
+    elif ctx.backend is not None:
+        body_q = ctx.backend.get_robot_q()
+    if body_q is None:
+        if args.live or args.state_source != "zeros":
+            # No state means no valid IK seed and no waist hold. Refusing
+            # is the safe branch: publishing a goal solved against a
+            # guessed configuration is worse than publishing nothing, and
+            # measuring against one is worse than not measuring.
+            print("[adapter] no robot state yet -- skipping chunk", file=sys.stderr)
+            return None
+        body_q = np.zeros(29)
+    return body_q
+
+
+def _fresh_body_q(ctx: _DecoupledContext, body_q):
+    """Re-read state as close to publish time as this process can get."""
+    fresh_body_q = body_q
+    if ctx.state_sub is not None:
+        fresh_q = ctx.state_sub.get_body_q()
+        if fresh_q is not None:
+            fresh_body_q = fresh_q
+    elif ctx.backend is not None:
+        fresh_q = ctx.backend.get_robot_q()
+        if fresh_q is not None:
+            fresh_body_q = fresh_q
+    return fresh_body_q
+
+
+def _chunk_age(ctx: _DecoupledContext, issued_at: float, what: str = "chunk"):
+    """Seconds since the sender issued this message, or None if it is too
+    old to act on (counted as stale).
+
+    DO NOT re-apply the sender's latency compensation. The reference
+    client already drops the rows its own inference latency consumed
+    AND backdates issued_at to when that inference started
+    (components/client.py: send_chunk(chunk[skip:], issued_at=now-L)).
+    Skipping again on that backdated stamp double-counts the same
+    latency -- measured here against a real team container it ate 11
+    of 16 rows on top of the client's own 4, leaving one usable row.
+    issued_at is still the right thing to judge STALENESS with; it is
+    just not an amount to re-skip by.
+    """
+    args = ctx.args
+    age = max(time.time() - issued_at, 0.0) if issued_at else 0.0
+    if args.max_chunk_age_s and age > args.max_chunk_age_s:
+        ctx.stats.stale += 1
+        if args.verbose:
+            print(f"[adapter] dropping {what} {age * 1000:.0f}ms old "
+                  f"(> {args.max_chunk_age_s * 1000:.0f}ms)", file=sys.stderr)
+        return None
+    return age
+
+
+def _step_clamp(ctx: _DecoupledContext, arms, i: int, fresh_body_q, max_step):
+    """Bound the per-waypoint arm step to max_step, anchored on the FRESH
+    measured arms for the first waypoint of every chunk.
+
+    2026-08-25: clamp against a FRESH state read, taken AFTER solving,
+    not the body_q read before the solve loop started. The solve loop
+    can legitimately take tens of ms (both arms, up to max_iters each,
+    across up to --max-waypoints rows) -- lowering max_iters (200->100,
+    same day) shrank this but could not zero it, because it was never
+    really an iteration-count problem: ANY nonzero solve time means the
+    real robot keeps moving (tracking whatever the PREVIOUS goal was)
+    while our clamp anchor sits frozen at a pose that's now stale by
+    exactly that amount. The clamp then bounds our own commanded sequence
+    to small steps relative to that stale anchor -- but says nothing
+    about the jump from wherever the robot ACTUALLY is (by publish time)
+    to wherever our first "clamped" waypoint claims to start from. That
+    jump is completely unbounded, and grows with solve time -- exactly
+    why violations correlated with slow solves (5ms/waypoint -> 35-40ms
+    right before each of the last two) without max_iters alone fixing
+    it. Re-fetching state, as close to publish time as this process can
+    get, and anchoring the clamp to THAT instead closes the actual gap
+    rather than the solve-time symptom of it. Lane/policy-agnostic --
+    this touches only the clamp, not IK itself, so it applies identically
+    to every lane through this same adapter, not just one team.
+
+    `arms` is always [left arm(7), right arm(7)], in the same order as
+    _q29(body_q)[15:29] -- see ik.py's _BODY_Q_NAMES.
+    """
+    if max_step is not None:
+        if i == 0:
+            ctx.last_commanded_arms = np.asarray(_q29(fresh_body_q)[15:29], dtype=np.float64)
+        arms = ctx.last_commanded_arms + np.clip(
+            arms - ctx.last_commanded_arms, -max_step, max_step)
+        ctx.last_commanded_arms = arms
+    return arms
+
+
+def _position_clamp(ctx: _DecoupledContext, arms):
+    """Joint lane only: pull each arm joint inside the robot model's limits.
+
+    Logs once per joint the first time it happens; every clamp larger than
+    CLAMP_REPORT_THRESHOLD_RAD is counted in stats.joints_clamped (smaller
+    trims are applied silently). The taskspace lane never comes here --
+    its IK is bounded by the solver's own limits.
+    """
+    lim = ctx.arm_limits
+    if lim is None:
+        return np.asarray(arms, dtype=np.float64)
+    clamped, _ = lim.clamp(arms)
+    # every clamp is applied; only a material one is reported
+    hit = np.abs(clamped - np.asarray(arms, dtype=np.float64)) > CLAMP_REPORT_THRESHOLD_RAD
+    if hit.any():
+        ctx.stats.joints_clamped += int(hit.sum())
+        for j in np.flatnonzero(hit):
+            j = int(j)
+            if j in ctx.clamp_logged:
+                continue
+            ctx.clamp_logged.add(j)
+            print(f"[adapter] joint lane: {lim.names[j]} commanded {arms[j]:+.4f} rad, "
+                  f"outside [{lim.lower[j]:+.4f}, {lim.upper[j]:+.4f}] -- clamped to "
+                  f"{clamped[j]:+.4f}. Reported once per joint; the [stats] line "
+                  f"counts every occurrence.", file=sys.stderr)
+    return clamped
+
+
+def _arm_waypoint(ctx: _DecoupledContext, fresh_body_q, arms, fallback):
+    """One WBC upper-body waypoint from 14 arm angles: the mapper replaces
+    only the arm slots (hands/waist pass through as measured); in bench
+    mode (no robot model) `fallback` supplies the rest of the vector."""
+    if ctx.mapper is not None:
+        return ctx.mapper.build_waypoint(fresh_body_q, arms[0:7], arms[7:14])
+    out = np.asarray(fallback, dtype=np.float64).copy()
+    out[:14] = arms
+    return out
+
+
+def _bench_upper_body(ctx: _DecoupledContext, fresh_body_q, arms):
+    """Bench-mode stand-in for the mapper on the joint lane: the solver's
+    width, arms first, measured waist appended iff --enable-waist -- the
+    same layout ik.py emits."""
+    if ctx.args.enable_waist:
+        return np.concatenate([arms, np.asarray(_q29(fresh_body_q)[12:15], dtype=np.float64)])
+    return np.asarray(arms, dtype=np.float64)
+
+
+def _publish_trajectory(ctx: _DecoupledContext, waypoints, base_heights, nav_cmds,
+                        wrist_pose, hands):
+    """Schedule `waypoints` from now at chunk_hz, publish, update the
+    keepalive template, relay the gripper. Shared by all three handlers."""
+    args, stats = ctx.args, ctx.stats
+    # Schedule from now, after our own solve cost -- the only latency
+    # this adapter is entitled to compensate for is the one it adds.
+    t_base = time.monotonic()
+    times = [t_base + (i + 1) / args.chunk_hz for i in range(len(waypoints))]
+
+    goal = wbc_goal.build_goal(
+        upper_body_waypoints=np.asarray(waypoints),
+        target_time=times,
+        # per-waypoint, straight off each row -- not just row 0
+        base_height_command=base_heights,
+        navigate_cmd=nav_cmds,
+        wrist_pose=wrist_pose,
+    )
+
+    if ctx.backend is not None:
+        ctx.backend.publish_goal(goal)
+        stats.published += 1
+        ctx.last_publish_time = time.monotonic()
+        # Hold-position template for a keepalive if the next real
+        # chunk is slow to arrive -- last waypoint reached, single-row.
+        ctx.last_goal_template = {
+            "upper_body": waypoints[-1],
+            "base_height": base_heights[-1],
+            "navigate_cmd": nav_cmds[-1],
+            "wrist_pose": wrist_pose,
+        }
+        # ...and the whole trajectory, for the keepalive to re-send the
+        # not-yet-due part of. Supersedes whatever was in flight before.
+        ctx.in_flight = {
+            "upper_body": list(waypoints), "times": list(times),
+            "base_heights": list(base_heights), "nav_cmds": list(nav_cmds),
+        }
+
+    # boundary/actions.py: cols [0:2] left hand, [2:4] right hand,
+    # -1 open .. +1 closed, both columns of a pair duplicated.
+    if ctx.dex1_pub is not None and hands is not None:
+        ctx.dex1_pub.send(b"dex1" + msgpack.packb(
+            {"left": float(hands[0]), "right": float(hands[1])},
+            use_bin_type=True))
+        stats.gripper_sent += 1
+    return goal, times
+
+
+def _maybe_report(ctx: _DecoupledContext):
+    if time.monotonic() - ctx.last_report > 2.0:
+        print(ctx.stats.report() + f" | {ctx.keepalives_sent} keepalives")
+        ctx.last_report = time.monotonic()
+
+
+def _handle_taskspace(ctx: _DecoupledContext, msg: bytes):
+    """One `taskspace` message: validate, IK per row, clamp, publish."""
+    args, stats = ctx.args, ctx.stats
+    try:
+        chunk = decode_taskspace(msg)
+    except Exception as exc:
+        stats.rejected += 1
+        print(f"[adapter] undecodable frame: {exc}", file=sys.stderr)
+        return
+
+    stats.messages += 1
+    problems = validate_taskspace(chunk)
+    if problems:
+        stats.rejected += 1
+        print(f"[adapter] REJECTED chunk: {'; '.join(problems)}", file=sys.stderr)
+        return
+
+    body_q = _read_body_q(ctx)
+    if body_q is None:
+        return
+
+    age = _chunk_age(ctx, chunk.issued_at)
+    if age is None:
+        return
+
+    rows = chunk.actions
+    waypoints = []
+    t_solve = time.monotonic()
+    dt = 1.0 / args.chunk_hz
+    max_step = args.max_joint_vel * dt if args.max_joint_vel else None
+    res0 = None
+    raw_results = []
+    solve_failed = False
+    for i, row in enumerate(rows[:args.max_waypoints]):
+        try:
+            res = ctx.solver.solve_row(row, _q29(body_q))
+        except Exception as exc:
+            # Fail closed. The WBC keeps its last published goal; never
+            # terminate the adapter or publish a partially solved chunk.
+            #
+            # Reachable since the 43->29 indexing fix: before it, the
+            # right arm's seed was a constant zero vector, inside every
+            # limit, so pink's check_limits could not fire on that side.
+            # The seed is now the real measured pose, which can sit
+            # microscopically outside the limits ik.py narrows below the
+            # URDF -- 2026-09-21 aborted the process on 0.904509 against
+            # a +/-0.9 wrist_roll override, 0.26 degrees over.
+            stats.rejected += 1
+            solve_failed = True
+            print(
+                f"[adapter] IK solve failed; holding last safe goal: "
+                f"{type(exc).__name__}: {exc}",
+                file=sys.stderr,
+            )
+            break
+        if i == 0:
+            res0 = res
+        stats.waypoints += 1
+        stats.left_ok += int(res.left_ok)
+        stats.right_ok += int(res.right_ok)
+        raw_results.append(res)
+        # Mid-solve watchdog (2026-09-03) -- see KEEPALIVE_DEADLINE_S.
+        # Checked after every waypoint, not just between chunks, because a
+        # slow chunk is exactly the case the zmq.Again-only keepalive
+        # can't see.
+        if (args.live and ctx.backend is not None and ctx.last_goal_template is not None
+                and time.monotonic() - ctx.last_publish_time > ctx.KEEPALIVE_DEADLINE_S):
+            _publish_keepalive(ctx)
+    solve_s = time.monotonic() - t_solve
+    stats.solve_ms += solve_s * 1000.0
+    if solve_failed:
+        return
+
+    fresh_body_q = _fresh_body_q(ctx, body_q)
+
+    for i, res in enumerate(raw_results):
+        # res.upper_body[:14] is always [left arm(7), right arm(7)], in
+        # the same order as _q29(body_q)[15:29] -- see ik.py's _BODY_Q_NAMES.
+        # Waist/hand slots are already held at measured values (ik.py's
+        # own waist passthrough; mapper.build_waypoint's for hands), so
+        # only the arm portion can ever jump and needs clamping here.
+        arms = _step_clamp(ctx, res.upper_body[:14].copy(), i, fresh_body_q, max_step)
+        # arm slots replaced; hands/waist pass through as measured
+        waypoints.append(_arm_waypoint(ctx, fresh_body_q, arms, res.upper_body))
+
+    if not waypoints:
+        return
+
+    n = len(waypoints)
+    wrist_pose = np.concatenate([rows[0][4:7], rows[0][7:11],
+                                 rows[0][11:14], rows[0][14:18]])
+    goal, _ = _publish_trajectory(
+        ctx, waypoints,
+        [[float(r[21])] for r in rows[:n]],
+        [np.asarray(r[18:21], dtype=np.float64) for r in rows[:n]],
+        wrist_pose, (rows[0][0], rows[0][2]))
+
+    if args.verbose:
+        # Diagnostic for the frame/offset question (ik.py's own header):
+        # the (T,25) contract never states which point on the hand the
+        # position means or in what frame -- these are the RAW targets
+        # the policy is actually outputting, right off the wire,
+        # so their physical plausibility (reach length, not embedded in
+        # the robot, tracking the scene over time) can be eyeballed
+        # directly rather than only inferred from IK's own residual.
+        print(f"[adapter] would publish {len(waypoints)} waypoints in "
+              f"{solve_s * 1000:.0f}ms (chunk age {age * 1000:.0f}ms), "
+              f"base_h={goal['base_height_command'][0][0]:.3f}, "
+              f"upper_body[0]={np.round(waypoints[0], 3)}")
+        if res0 is not None:
+            print(f"[adapter] row0 RAW targets (pelvis frame, ik.py's "
+                  f"assumption) -- "
+                  f"left_pos={np.round(rows[0][4:7], 3)} "
+                  f"left_quat={np.round(rows[0][7:11], 3)} "
+                  f"left_err={res0.left_err:.4f} left_ok={res0.left_ok} | "
+                  f"right_pos={np.round(rows[0][11:14], 3)} "
+                  f"right_quat={np.round(rows[0][14:18], 3)} "
+                  f"right_err={res0.right_err:.4f} right_ok={res0.right_ok} | "
+                  f"left_hand={rows[0][0]:.3f} right_hand={rows[0][2]:.3f} "
+                  f"(-1=open, +1=closed)")
+
+    _maybe_report(ctx)
+
+
+def _handle_joint(ctx: _DecoupledContext, msg: bytes):
+    """One `joint` message: (T,22) rows of hands + arm angles + base cmds.
+
+    Same gates as the taskspace path (decode, validate, robot state,
+    staleness), then position clamp -> the SAME step clamp -> mapper ->
+    build_goal -> publish -> gripper relay. No IK is involved: the WBC's
+    native input is joint space, so the row's arm angles go into the goal
+    as they are, bounded but never re-solved.
+    """
+    args, stats = ctx.args, ctx.stats
+    try:
+        chunk = decode_joint(msg)
+    except Exception as exc:
+        stats.rejected += 1
+        stats.joint_rejected += 1
+        print(f"[adapter] undecodable joint frame: {exc}", file=sys.stderr)
+        return
+
+    stats.messages += 1
+    problems = validate_joint(chunk)
+    if problems:
+        stats.rejected += 1
+        stats.joint_rejected += 1
+        print(f"[adapter] REJECTED joint chunk: {'; '.join(problems)}", file=sys.stderr)
+        return
+
+    # Fail closed, like the IK path: an exception past this point drops
+    # the chunk (counted, logged), never the adapter. The WBC keeps its
+    # last goal and the keepalive keeps refreshing it.
+    try:
+        _apply_joint_chunk(ctx, chunk)
+    except Exception as exc:
+        stats.rejected += 1
+        stats.joint_rejected += 1
+        print(f"[adapter] joint chunk failed; holding last safe goal: "
+              f"{type(exc).__name__}: {exc}", file=sys.stderr)
+
+
+def _apply_joint_chunk(ctx: _DecoupledContext, chunk):
+    args, stats = ctx.args, ctx.stats
+    body_q = _read_body_q(ctx)
+    if body_q is None:
+        return
+
+    age = _chunk_age(ctx, chunk.issued_at, "joint chunk")
+    if age is None:
+        return
+
+    rows = chunk.actions
+    dt = 1.0 / args.chunk_hz
+    max_step = args.max_joint_vel * dt if args.max_joint_vel else None
+    # No solve stands between reading the state and clamping against it,
+    # so the read above IS the fresh anchor the taskspace path re-fetches.
+    waypoints = []
+    for i, row in enumerate(rows[:args.max_waypoints]):
+        arms = np.concatenate([row[4:11], row[11:18]]).astype(np.float64)
+        arms = _position_clamp(ctx, arms)
+        arms = _step_clamp(ctx, arms, i, body_q, max_step)
+        waypoints.append(_arm_waypoint(ctx, body_q, arms,
+                                       _bench_upper_body(ctx, body_q, arms)))
+
+    if not waypoints:
+        return
+
+    n = len(waypoints)
+    stats.joint_accepted += 1
+    goal, _ = _publish_trajectory(
+        ctx, waypoints,
+        [[float(r[21])] for r in rows[:n]],
+        [np.asarray(r[18:21], dtype=np.float64) for r in rows[:n]],
+        None, (rows[0][0], rows[0][2]))
+
+    if args.verbose:
+        print(f"[adapter] joint chunk: {n} waypoints (chunk age {age * 1000:.0f}ms), "
+              f"base_h={goal['base_height_command'][0][0]:.3f}, "
+              f"upper_body[0]={np.round(waypoints[0], 3)} | "
+              f"left_hand={rows[0][0]:.3f} right_hand={rows[0][2]:.3f} "
+              f"(-1=open, +1=closed)")
+
+    _maybe_report(ctx)
+
+
+def _handle_goto(ctx: _DecoupledContext, msg: bytes):
+    """One `goto` message: straight-line joint interpolation from the
+    measured arms to the requested ones, published as ONE multi-waypoint
+    goal through the same clamp -> mapper -> build_goal -> publish path.
+
+    Speed is min(request, --goto-max-speed, --max-joint-vel): the last term
+    makes the step clamp a no-op by construction, so the final waypoint IS
+    the target rather than wherever a clipped ramp happened to end. Does
+    not block -- the client watches body_q on :5557 to decide arrival.
+    """
+    args, stats = ctx.args, ctx.stats
+    try:
+        req = decode_goto(msg)
+    except Exception as exc:
+        stats.rejected += 1
+        stats.goto_rejected += 1
+        print(f"[adapter] undecodable goto frame: {exc}", file=sys.stderr)
+        return
+
+    stats.messages += 1
+    problems = validate_goto(req)
+    if problems:
+        stats.rejected += 1
+        stats.goto_rejected += 1
+        print(f"[adapter] REJECTED goto: {'; '.join(problems)}", file=sys.stderr)
+        return
+
+    try:
+        _apply_goto(ctx, req)
+    except Exception as exc:
+        # Fail closed, like the IK path: the request is dropped, the
+        # adapter and the WBC's last goal both survive.
+        stats.rejected += 1
+        stats.goto_rejected += 1
+        print(f"[adapter] goto failed; holding last safe goal: "
+              f"{type(exc).__name__}: {exc}", file=sys.stderr)
+
+
+def _apply_goto(ctx: _DecoupledContext, req):
+    args, stats = ctx.args, ctx.stats
+    # A goto starts from the measured arms, so the measurement must be
+    # current, not merely present. (Chunks are anchored the same way but
+    # arrive continuously; a goto is a one-shot from a possibly idle
+    # state, so it is held to the backend's own staleness verdict.)
+    if ctx.backend is not None and ctx.backend.health().get("state_stale"):
+        stats.rejected += 1
+        stats.goto_rejected += 1
+        print("[adapter] robot state stale, goto refused", file=sys.stderr)
+        return
+
+    body_q = _read_body_q(ctx)
+    if body_q is None:
+        return
+
+    age = _chunk_age(ctx, req.issued_at, "goto")
+    if age is None:
+        return
+
+    target = _position_clamp(ctx, np.concatenate([req.left_arm, req.right_arm]))
+    measured = np.asarray(_q29(body_q)[15:29], dtype=np.float64)
+    speed = min(req.max_speed, args.goto_max_speed)
+    if args.max_joint_vel:
+        speed = min(speed, args.max_joint_vel)
+    dt = 1.0 / args.chunk_hz
+    max_step = args.max_joint_vel * dt if args.max_joint_vel else None
+    delta = float(np.max(np.abs(target - measured)))
+    steps = max(1, int(math.ceil(delta / (speed * dt) - 1e-9)))
+    if steps > args.chunk_hz * GOTO_MAX_DURATION_S:
+        stats.rejected += 1
+        stats.goto_rejected += 1
+        print(f"[adapter] REJECTED goto: {delta:.3f} rad at {speed:.3f} rad/s "
+              f"would take {steps * dt:.1f}s, over the {GOTO_MAX_DURATION_S:.0f}s "
+              f"cap -- ask for a faster move or a nearer pose", file=sys.stderr)
+        return
+    path = np.linspace(measured, target, steps + 1)[1:]
+
+    waypoints = []
+    for i, arms in enumerate(path):
+        arms = _step_clamp(ctx, arms, i, body_q, max_step)
+        waypoints.append(_arm_waypoint(ctx, body_q, arms,
+                                       _bench_upper_body(ctx, body_q, arms)))
+
+    # A goto moves the arms and nothing else: the base stands still
+    # (navigate_cmd zero -- never inherit a walking command from the last
+    # chunk for the whole ramp) at the last commanded height, or the WBC's
+    # own default height when nothing was commanded yet.
+    tpl = ctx.last_goal_template
+    base_height = [wbc_goal.DEFAULT_BASE_HEIGHT] if tpl is None else list(tpl["base_height"])
+    navigate = np.asarray(wbc_goal.DEFAULT_NAV_CMD, dtype=np.float64)
+    n = len(waypoints)
+    stats.goto_accepted += 1
+    hands = None if req.hands is None else (req.hands[0], req.hands[1])
+    _publish_trajectory(ctx, waypoints, [base_height] * n, [navigate] * n, None, hands)
+    print(f"[adapter] goto: {n} waypoints over {n * dt:.2f}s at {speed:.2f} rad/s "
+          f"(max |delta| {delta:.3f} rad, request {req.max_speed:.2f} rad/s, "
+          f"age {age * 1000:.0f}ms)")
+
+    _maybe_report(ctx)
 
 
 def run_decoupled(args, sub: zmq.Socket, stats: Stats):
@@ -249,7 +1017,6 @@ def run_decoupled(args, sub: zmq.Socket, stats: Stats):
     # is not possible, see that file's header.
     dex1_pub = None
     if args.dex1_port:
-        import msgpack as _mp
         _ctx = zmq.Context.instance()
         dex1_pub = _ctx.socket(zmq.PUB)
         dex1_pub.setsockopt(zmq.LINGER, 0)
@@ -259,307 +1026,78 @@ def run_decoupled(args, sub: zmq.Socket, stats: Stats):
     else:
         print("[adapter] --dex1-port 0: gripper commands DISCARDED, no grasp possible")
 
-    # Rate-limits the commanded arm joints against the last waypoint this
-    # adapter actually scheduled. IK has no notion of how far away in TIME
-    # its target is -- chunk_hz alone schedules the first waypoint of every
-    # chunk only 1/chunk_hz out, so a solved pose far from the current one
-    # implies whatever velocity that delta needs, with nothing capping it.
-    # Measured tripping the WBC's own real-hardware-only joint safety
-    # monitor (joint_safety.py, +-6 rad/s): first at ~7.3-7.4 rad/s on the
-    # first live goal (fixed by clamping), then again later at -6.570 rad/s
-    # on right_elbow_joint on a run where the clamp was active the whole
-    # time -- see the i==0 branch below for why (the clamp's reference point
-    # can silently drift from the robot's real position if it's only ever
-    # updated from what THIS process last commanded). Reset every chunk to
-    # ground-truth body_q now, not just once at startup.
-    last_commanded_arms = None
-    # Last successfully-published waypoint + its accompanying fields, kept
-    # around purely so a keepalive (see zmq.Again below) can hold this
-    # exact position rather than reconstructing one from parts.
-    last_goal_template: dict | None = None
-    keepalives_sent = 0
-    # 2026-09-03: wall-clock time of the last thing actually published to
-    # the WBC, by ANY path (real chunk or keepalive). See the mid-solve
-    # watchdog check below for why this exists separately from the
-    # zmq.Again-triggered keepalive above -- that one only fires when this
-    # loop is BLOCKED waiting for a message; it does nothing if the loop is
-    # instead BUSY solving one. Traced a real live violation
-    # (right_elbow_joint -8.992 rad/s) to exactly that gap: the team's
-    # client published on a steady ~300ms cadence the whole time (confirmed
-    # independently via capture_evidence.py's own separate subscription,
-    # zero gaps >330ms anywhere near the violation) and the adapter's own
-    # [stats] line showed 0 keepalives for the entire run right up to the
-    # trip -- so `zmq.Again` never fired even though the WBC's own >1.0s
-    # "no fresh goal" watchdog still did, and injected the unclamped
-    # transition that caused it (confirmed: a "Teleop mode timeout" line
-    # sits directly before that violation in the WBC log). CONFLATE=1 on
-    # this socket means as long as a message is EVER waiting, `sub.recv()`
-    # returns immediately rather than timing out -- so a slow processing
-    # cycle (not a slow client) can silently eat the whole 1.0s budget with
-    # this loop technically busy the entire time, never once blocked long
-    # enough to hit the existing keepalive path.
-    last_publish_time = time.monotonic()
-    # Margin under the WBC's ~1.0s watchdog -- fire before it does, not
-    # after. Checked between individual waypoint solves (see below), not
-    # just between chunks, since the solve loop itself is where a slow
-    # cycle actually accumulates.
-    KEEPALIVE_DEADLINE_S = 0.7
+    # Joint lane: same socket, same loop, joint angles instead of poses.
+    # Its position clamp reads the robot model's limits; it never types
+    # them in. Off means the two topics are ignored exactly like any other
+    # unknown prefix.
+    joint_lane = args.joint_lane == "on"
+    arm_limits = None
+    joint_lane_error = None
+    if joint_lane:
+        try:
+            arm_limits = _load_arm_limits(args.joint_lane_limits, mapper, solver.settings)
+        except Exception as exc:
+            # Never refuse to launch over this: a taskspace-only run does
+            # not need the joint lane at all. Disable the lane for this
+            # run -- joint/goto messages are then rejected and counted,
+            # loudly, rather than driven unclamped.
+            joint_lane_error = f"{type(exc).__name__}: {exc}"
+            print("=" * 70, file=sys.stderr)
+            print(f"[adapter] WARNING: joint lane DISABLED for this run -- its "
+                  f"position limits could not be read from the robot model "
+                  f"({joint_lane_error}). b'joint'/b'goto' messages will be "
+                  f"REJECTED and counted. The taskspace lane is unaffected.",
+                  file=sys.stderr)
+            print("=" * 70, file=sys.stderr)
+        if arm_limits is not None:
+            print(f"[adapter] joint lane: ON -- topics {JOINT_TOPIC!r}/{GOTO_TOPIC!r}, "
+                  f"limits={args.joint_lane_limits}, goto max speed "
+                  f"{args.goto_max_speed:.2f} rad/s (cap {GOTO_MAX_DURATION_S:.0f}s "
+                  f"per move), position clamp ON")
+            print(f"[adapter] joint lane limits ({arm_limits.describe()})")
+    else:
+        print(f"[adapter] joint lane: OFF -- {JOINT_TOPIC!r}/{GOTO_TOPIC!r} ignored")
 
-    last_report = time.monotonic()
+    ctx = _DecoupledContext(args, stats, backend, state_sub, solver, mapper,
+                            dex1_pub, arm_limits)
+    ctx.joint_lane_error = joint_lane_error
     while True:
         try:
             msg = sub.recv()
         except zmq.Again:
-            # 2026-08-25: publish a keepalive -- hold the last commanded
-            # position, refreshed target_time -- rather than doing nothing.
-            # See the RCVTIMEO comment above: the WBC has its own ~1.0s
-            # "no fresh goal" watchdog that injects an UNCLAMPED transition
-            # of its own if we go quiet too long. A short RCVTIMEO alone
-            # only helps if we actually USE the extra wakeups to publish
-            # something -- this is that.
-            if args.live and backend is not None and last_goal_template is not None:
-                keep_goal = wbc_goal.build_goal(
-                    upper_body_waypoints=last_goal_template["upper_body"],
-                    target_time=[time.monotonic() + 1.0 / args.chunk_hz],
-                    base_height_command=last_goal_template["base_height"],
-                    navigate_cmd=last_goal_template["navigate_cmd"],
-                    wrist_pose=last_goal_template["wrist_pose"],
-                )
-                backend.publish_goal(keep_goal)
-                keepalives_sent += 1
-                last_publish_time = time.monotonic()
-            else:
+            if not _publish_keepalive(ctx):
                 print("[adapter] no actions on :5556 yet (is the team's Orin client up?)")
             continue
-        if not msg.startswith(TASKSPACE_TOPIC):
-            continue
+        _dispatch(ctx, msg)
 
-        try:
-            chunk = decode_taskspace(msg)
-        except Exception as exc:
-            stats.rejected += 1
-            print(f"[adapter] undecodable frame: {exc}", file=sys.stderr)
-            continue
 
-        stats.messages += 1
-        problems = validate_taskspace(chunk)
-        if problems:
-            stats.rejected += 1
-            print(f"[adapter] REJECTED chunk: {'; '.join(problems)}", file=sys.stderr)
-            continue
-
-        body_q = None
-        if state_sub is not None:
-            body_q = state_sub.get_body_q()
-        elif backend is not None:
-            body_q = backend.get_robot_q()
-        if body_q is None:
-            if args.live or args.state_source != "zeros":
-                # No state means no valid IK seed and no waist hold. Refusing
-                # is the safe branch: publishing a goal solved against a
-                # guessed configuration is worse than publishing nothing, and
-                # measuring against one is worse than not measuring.
-                print("[adapter] no robot state yet -- skipping chunk", file=sys.stderr)
-                continue
-            body_q = np.zeros(29)
-
-        # DO NOT re-apply the sender's latency compensation. The reference
-        # client already drops the rows its own inference latency consumed
-        # AND backdates issued_at to when that inference started
-        # (components/client.py: send_chunk(chunk[skip:], issued_at=now-L)).
-        # Skipping again on that backdated stamp double-counts the same
-        # latency -- measured here against a real team container it ate 11
-        # of 16 rows on top of the client's own 4, leaving one usable row.
-        # issued_at is still the right thing to judge STALENESS with; it is
-        # just not an amount to re-skip by.
-        age = max(time.time() - chunk.issued_at, 0.0) if chunk.issued_at else 0.0
-        if args.max_chunk_age_s and age > args.max_chunk_age_s:
-            stats.stale += 1
-            if args.verbose:
-                print(f"[adapter] dropping chunk {age * 1000:.0f}ms old "
-                      f"(> {args.max_chunk_age_s * 1000:.0f}ms)", file=sys.stderr)
-            continue
-
-        rows = chunk.actions
-        waypoints, times = [], []
-        t_solve = time.monotonic()
-        dt = 1.0 / args.chunk_hz
-        max_step = args.max_joint_vel * dt if args.max_joint_vel else None
-        res0 = None
-        raw_results = []
-        solve_failed = False
-        for i, row in enumerate(rows[:args.max_waypoints]):
-            try:
-                res = solver.solve_row(row, _q29(body_q))
-            except Exception as exc:
-                # Fail closed. The WBC keeps its last published goal; never
-                # terminate the adapter or publish a partially solved chunk.
-                #
-                # Reachable since the 43->29 indexing fix: before it, the
-                # right arm's seed was a constant zero vector, inside every
-                # limit, so pink's check_limits could not fire on that side.
-                # The seed is now the real measured pose, which can sit
-                # microscopically outside the limits ik.py narrows below the
-                # URDF -- 2026-09-21 aborted the process on 0.904509 against
-                # a +/-0.9 wrist_roll override, 0.26 degrees over.
-                stats.rejected += 1
-                solve_failed = True
-                print(
-                    f"[adapter] IK solve failed; holding last safe goal: "
-                    f"{type(exc).__name__}: {exc}",
-                    file=sys.stderr,
-                )
-                break
-            if i == 0:
-                res0 = res
-            stats.waypoints += 1
-            stats.left_ok += int(res.left_ok)
-            stats.right_ok += int(res.right_ok)
-            raw_results.append(res)
-            # Mid-solve watchdog (2026-09-03) -- see the comment on
-            # KEEPALIVE_DEADLINE_S above. Checked after every waypoint, not
-            # just between chunks, because a slow chunk is exactly the case
-            # the existing zmq.Again-only keepalive can't see.
-            if (args.live and backend is not None and last_goal_template is not None
-                    and time.monotonic() - last_publish_time > KEEPALIVE_DEADLINE_S):
-                keep_goal = wbc_goal.build_goal(
-                    upper_body_waypoints=last_goal_template["upper_body"],
-                    target_time=[time.monotonic() + 1.0 / args.chunk_hz],
-                    base_height_command=last_goal_template["base_height"],
-                    navigate_cmd=last_goal_template["navigate_cmd"],
-                    wrist_pose=last_goal_template["wrist_pose"],
-                )
-                backend.publish_goal(keep_goal)
-                keepalives_sent += 1
-                last_publish_time = time.monotonic()
-        solve_s = time.monotonic() - t_solve
-        stats.solve_ms += solve_s * 1000.0
-        if solve_failed:
-            continue
-
-        # 2026-08-25: clamp against a FRESH state read, taken AFTER solving,
-        # not the body_q read before the solve loop started. The solve loop
-        # above can legitimately take tens of ms (both arms, up to
-        # max_iters each, across up to --max-waypoints rows) -- lowering
-        # max_iters (200->100, same day) shrank this but could not zero it,
-        # because it was never really an iteration-count problem: ANY
-        # nonzero solve time means the real robot keeps moving (tracking
-        # whatever the PREVIOUS goal was) while our clamp anchor sits
-        # frozen at a pose that's now stale by exactly that amount. The
-        # clamp then bounds our own commanded sequence to small steps
-        # relative to that stale anchor -- but says nothing about the jump
-        # from wherever the robot ACTUALLY is (by publish time) to wherever
-        # our first "clamped" waypoint claims to start from. That jump is
-        # completely unbounded, and grows with solve time -- exactly why
-        # violations correlated with slow solves (5ms/waypoint -> 35-40ms
-        # right before each of the last two) without max_iters alone fixing
-        # it. Re-fetching state here, as close to publish time as this
-        # process can get, and anchoring the clamp to THAT instead closes
-        # the actual gap rather than the solve-time symptom of it. Lane/
-        # policy-agnostic -- this touches only the clamp, not IK itself, so
-        # it applies identically to GR00T-based teams using the sonic or
-        # decoupled lane through this same adapter, not just one team.
-        fresh_body_q = body_q
-        if state_sub is not None:
-            fresh_q = state_sub.get_body_q()
-            if fresh_q is not None:
-                fresh_body_q = fresh_q
-        elif backend is not None:
-            fresh_q = backend.get_robot_q()
-            if fresh_q is not None:
-                fresh_body_q = fresh_q
-
-        for i, res in enumerate(raw_results):
-            # res.upper_body[:14] is always [left arm(7), right arm(7)], in
-            # the same order as _q29(body_q)[15:29] -- see ik.py's _BODY_Q_NAMES.
-            # Waist/hand slots are already held at measured values (ik.py's
-            # own waist passthrough; mapper.build_waypoint's for hands), so
-            # only the arm portion can ever jump and needs clamping here.
-            arms = res.upper_body[:14].copy()
-            if max_step is not None:
-                if i == 0:
-                    last_commanded_arms = np.asarray(_q29(fresh_body_q)[15:29], dtype=np.float64)
-                arms = last_commanded_arms + np.clip(
-                    arms - last_commanded_arms, -max_step, max_step)
-                last_commanded_arms = arms
-
-            if mapper is not None:
-                # arm slots replaced; hands/waist pass through as measured
-                waypoints.append(mapper.build_waypoint(
-                    fresh_body_q, arms[0:7], arms[7:14]))
-            else:
-                out = res.upper_body.copy()
-                out[:14] = arms
-                waypoints.append(out)
-
-        if not waypoints:
-            continue
-
-        # Schedule from now, after our own solve cost -- the only latency
-        # this adapter is entitled to compensate for is the one it adds.
-        t_base = time.monotonic()
-        times = [t_base + (i + 1) / args.chunk_hz for i in range(len(waypoints))]
-
-        n = len(waypoints)
-        goal = wbc_goal.build_goal(
-            upper_body_waypoints=np.asarray(waypoints),
-            target_time=times,
-            # per-waypoint, straight off each row -- not just row 0
-            base_height_command=[[float(r[21])] for r in rows[:n]],
-            navigate_cmd=[np.asarray(r[18:21], dtype=np.float64) for r in rows[:n]],
-            wrist_pose=np.concatenate([rows[0][4:7], rows[0][7:11],
-                                       rows[0][11:14], rows[0][14:18]]),
-        )
-
-        if backend is not None:
-            backend.publish_goal(goal)
-            stats.published += 1
-            last_publish_time = time.monotonic()
-            # Hold-position template for a keepalive if the next real
-            # chunk is slow to arrive -- last waypoint reached, single-row.
-            last_goal_template = {
-                "upper_body": waypoints[-1],
-                "base_height": [float(rows[n - 1][21])],
-                "navigate_cmd": np.asarray(rows[n - 1][18:21], dtype=np.float64),
-                "wrist_pose": np.concatenate([rows[0][4:7], rows[0][7:11],
-                                              rows[0][11:14], rows[0][14:18]]),
-            }
-
-        # boundary/actions.py: cols [0:2] left hand, [2:4] right hand,
-        # -1 open .. +1 closed, both columns of a pair duplicated.
-        if dex1_pub is not None:
-            dex1_pub.send(b"dex1" + _mp.packb(
-                {"left": float(rows[0][0]), "right": float(rows[0][2])},
-                use_bin_type=True))
-            stats.gripper_sent += 1
-
-        if args.verbose:
-            # Diagnostic for the frame/offset question (ik.py's own header):
-            # the (T,25) contract never states which point on the hand the
-            # position means or in what frame -- these are the RAW targets
-            # the policy is actually outputting, right off the wire,
-            # so their physical plausibility (reach length, not embedded in
-            # the robot, tracking the scene over time) can be eyeballed
-            # directly rather than only inferred from IK's own residual.
-            print(f"[adapter] would publish {len(waypoints)} waypoints in "
-                  f"{solve_s * 1000:.0f}ms (chunk age {age * 1000:.0f}ms), "
-                  f"base_h={goal['base_height_command'][0][0]:.3f}, "
-                  f"upper_body[0]={np.round(waypoints[0], 3)}")
-            if res0 is not None:
-                print(f"[adapter] row0 RAW targets (pelvis frame, ik.py's "
-                      f"assumption) -- "
-                      f"left_pos={np.round(rows[0][4:7], 3)} "
-                      f"left_quat={np.round(rows[0][7:11], 3)} "
-                      f"left_err={res0.left_err:.4f} left_ok={res0.left_ok} | "
-                      f"right_pos={np.round(rows[0][11:14], 3)} "
-                      f"right_quat={np.round(rows[0][14:18], 3)} "
-                      f"right_err={res0.right_err:.4f} right_ok={res0.right_ok} | "
-                      f"left_hand={rows[0][0]:.3f} right_hand={rows[0][2]:.3f} "
-                      f"(-1=open, +1=closed)")
-
-        if time.monotonic() - last_report > 2.0:
-            print(stats.report() + f" | {keepalives_sent} keepalives")
-            last_report = time.monotonic()
+def _dispatch(ctx: _DecoupledContext, msg: bytes):
+    """Route one :5556 message by topic prefix. Anything else is ignored."""
+    if msg.startswith(TASKSPACE_TOPIC):
+        _handle_taskspace(ctx, msg)
+        return
+    is_joint = msg.startswith(JOINT_TOPIC)
+    is_goto = msg.startswith(GOTO_TOPIC)
+    if not (is_joint or is_goto):
+        return
+    if not ctx.joint_lane:
+        return      # --joint-lane off: ignored like any unknown prefix
+    if ctx.joint_lane_error is not None:
+        ctx.stats.rejected += 1
+        if is_joint:
+            ctx.stats.joint_rejected += 1
+        else:
+            ctx.stats.goto_rejected += 1
+        if not ctx.joint_lane_error_logged:
+            ctx.joint_lane_error_logged = True
+            print(f"[adapter] REJECTED {'joint chunk' if is_joint else 'goto'}: joint "
+                  f"lane disabled this run ({ctx.joint_lane_error}); further "
+                  f"rejections are counted, not logged", file=sys.stderr)
+        return
+    if is_joint:
+        _handle_joint(ctx, msg)
+    else:
+        _handle_goto(ctx, msg)
 
 
 _COMMAND_HEADER_SIZE = 1280  # must match ZMQPackedMessageSubscriber::HEADER_SIZE
@@ -752,7 +1290,19 @@ def _refuse_incompatible_state_source(args):
     raise SystemExit(2)
 
 
-def main():
+def _positive_float(text: str) -> float:
+    try:
+        value = float(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"{text!r} is not a number")
+    if not (math.isfinite(value) and value > 0.0):
+        raise argparse.ArgumentTypeError(
+            f"must be > 0 rad/s, got {text!r} (0 does not mean 'disable' here; "
+            f"--joint-lane off is the switch)")
+    return value
+
+
+def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument("--lane", required=True, choices=LANES,
                    help="must match the team's manifest.yaml")
@@ -867,6 +1417,20 @@ def main():
     p.add_argument("--max-chunk-age-s", type=float, default=1.0,
                    help="drop a chunk older than this (0 disables). Guards "
                         "against acting on a stale plan after a stall.")
+    # joint lane (rides on the decoupled stack; see the module docstring)
+    p.add_argument("--joint-lane", default="on", choices=("on", "off"),
+                   help="accept the b'joint' (T,22) joint-angle chunks and b'goto' "
+                        "pose requests on the same :5556 socket, alongside "
+                        "b'taskspace'. The taskspace path is unaffected either "
+                        "way. 'off' ignores both topics like any unknown prefix.")
+    p.add_argument("--joint-lane-limits", default="urdf", choices=("urdf", "ik"),
+                   help="which position limits the joint lane clamps arm angles to (never typed in; read from the robot model file). 'urdf' (default) = the RAW URDF limits of g1_29dof_with_hand.urdf, the model both the WBC's robot model and ik.py load -- NOT the WBC RobotModel's supplemental-narrowed arrays (its 0.19 rad shoulder_roll narrowing is enforced by nothing on the robot: its JointSafetyMonitor treats position violations as warnings, and the pose lane's IK ranges over the raw URDF too). 'ik' = the same raw URDF limits plus ik.py's solver-side overrides (elbow upper bound 1.4, wrist_roll +-0.9, read from IKSettings) -- exactly what PinkArmIK enforces -- so the joint lane ranges over the same space the taskspace lane's IK does; those exist to steer a redundant solution, not to protect hardware, so they are not the default. Switch if ruled.")
+    p.add_argument("--goto-max-speed", type=_positive_float, default=0.45,
+                   help="rad/s ceiling on a b'goto' request's own max_speed; "
+                        "must be > 0 (--joint-lane off is the switch, not 0). "
+                        "Also capped by --max-joint-vel so the step clamp never "
+                        "shortens the ramp. 0.45 is the speed the joint-space "
+                        "pre-motion that preceded this lane ran at live.")
     # sonic
     p.add_argument("--sonic-host", default="127.0.0.1")
     p.add_argument("--sonic-port", type=int, default=5580,
@@ -884,7 +1448,11 @@ def main():
                         "gear_sonic_deploy is actually launched with matches "
                         "this value exactly.")
     p.add_argument("--sonic-socket", default="pub", choices=("pub", "push"))
-    args = p.parse_args()
+    return p
+
+
+def main():
+    args = build_parser().parse_args()
     _refuse_incompatible_state_source(args)
 
     print(f"[adapter] lane={args.lane} "

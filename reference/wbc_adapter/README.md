@@ -100,6 +100,25 @@ mattered on hardware:
 3. **Accept-rate denominator.** IK is solved per waypoint but the rate was
    divided by messages, reporting >100%.
 
+## The `joint` lane
+
+Policies trained on joint-space actions do not need the IK at all: the
+Decoupled WBC's native input is a joint-space `target_upper_body_pose`.
+The same `wbc_driver.py --lane decoupled` process therefore also accepts a
+`b"joint"` topic — `(T,22)` rows of hand commands, 7+7 arm joint angles in
+`G1JointIndex` order, `navigate_cmd` and `base_height_cmd` — and a
+`b"goto"` request that interpolates the arms from the measured pose to a
+target at a bounded speed as one multi-waypoint goal. Rows are
+position-clamped to the robot model's own limits (read from the WBC's
+model, `--joint-lane-limits`), rate-clamped by the existing
+`--max-joint-vel` step clamp anchored on the fresh measured arms, mapped
+into the 28-wide vector by `UpperBodyMapper` (hand slots copied from state)
+and published exactly as an IK result would be. `--joint-lane off` disables
+both topics. The taskspace path is untouched; `tests/test_joint_lane.py`
+proves it by replaying the same chunks through the pre-lane driver (pulled
+from git) and asserting identical goals. Wire spec: `docs/CONTRACT.md`,
+"The `joint` lane".
+
 ## Safety
 
 This adapter is **not** a safety system. It re-checks the contract floor
@@ -137,7 +156,7 @@ python3 wbc_driver.py --lane sonic --live \
 ```
 
 `--enable-waist` **must** match how `run_g1_control_loop.py` was launched:
-waist in the upper-body group means width 17, otherwise 14. Get it wrong
+waist in the upper-body group means width 31, otherwise 28 (7+7 arm joints plus 7+7 hand-model slots; `--no-with-hands` does not shrink it). Get it wrong
 and every joint in the vector is misaligned. Read it from the robot model
 rather than trusting the flag where you can.
 
